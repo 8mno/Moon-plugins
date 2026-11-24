@@ -34,10 +34,23 @@
               "version": "*"
             }
           }
+        },
+        "0.1.2": {
+          "url": "https://8mno.github.io/Moon-plugins/Valenced/pool/moon.quest-inspector@0.1.2.zip",
+          "sha256": "79bc0c3546f061a86b82073ca0445441e7b1e7c95616d98052434ae755fe1e6e",
+          "size": 6146,
+          "dependencies": {
+            "valenced.api": {
+              "version": ">=1 <2"
+            },
+            "discord": {
+              "version": "*"
+            }
+          }
         }
       },
       "channels": {
-        "latest": "0.1.1"
+        "latest": "0.1.2"
       }
     }
   }
