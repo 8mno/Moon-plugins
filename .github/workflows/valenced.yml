@@ -1,0 +1,32 @@
+name: Build Valenced repo
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Valenced/plugins/**'
+      - 'Valenced/repo.config.json'
+      - 'Valenced/build.py'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build plugin ZIPs and index.json
+        run: python3 Valenced/build.py
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Valenced/pool Valenced/index.json
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+          else
+            git commit -m "Build Valenced repo"
+            git push
+          fi
