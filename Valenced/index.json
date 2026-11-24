@@ -1,0 +1,31 @@
+{
+  "format": 1,
+  "name": "Moon's Plugins",
+  "description": "Moon's plugins for Valenced.",
+  "plugins": {
+    "moon.quest-inspector": {
+      "name": "Quest Inspector",
+      "description": "See every quest your Discord client has (including hidden ones), get alerts for new quests, and accept quests from one place.",
+      "author": "Moon",
+      "icon": "QuestsIcon",
+      "versions": {
+        "0.1.0": {
+          "url": "https://8mno.github.io/Moon-plugins/Valenced/pool/moon.quest-inspector@0.1.0.zip",
+          "sha256": "ddf1ae756efbbd9b54a63b52041a1eba5c579354ad39a36e1e02c59e425489eb",
+          "size": 5954,
+          "dependencies": {
+            "valenced.api": {
+              "version": ">=1 <2"
+            },
+            "discord": {
+              "version": "*"
+            }
+          }
+        }
+      },
+      "channels": {
+        "latest": "0.1.0"
+      }
+    }
+  }
+}
