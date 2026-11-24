@@ -205,14 +205,31 @@
   // Keep the same merged object for the same hook result, so React consumers that put the
   // result in effect/memo deps don't see a brand-new object on every render.
   var mergedCache = new WeakMap();
+  var skippedHidden = 0;   // hidden quests left out of the native list because a card can't render them
+  function hasMessages(o) { return isObj(o) && isObj(o.messages); }
+  function cardReady(q) {
+    var cfg = isObj(q) && isObj(q.config) ? q.config : null;
+    if (!cfg || !hasMessages(cfg)) return false;
+    var rc = cfg.rewardsConfig || cfg.rewards_config;
+    var rewards = isObj(rc) && Array.isArray(rc.rewards) ? rc.rewards : null;
+    if (!rewards || rewards.length === 0) return false;
+    for (var i = 0; i < rewards.length; i++) if (!hasMessages(rewards[i])) return false;
+    return isObj(cfg.application);
+  }
   function mergeHidden(res) {
     if (!isObj(res) || !Array.isArray(res.quests) || !Array.isArray(res.excludedQuests) || res.excludedQuests.length === 0) return res;
     var hit = mergedCache.get(res);
     if (hit) return hit;
     var ids = new Set(res.quests.map(function (q) { return q && q.id; }));
+    var skipped = 0;
     var extra = res.excludedQuests.filter(function (q) {
-      return isObj(q) && !ids.has(q.id) && describe(q).status !== 'expired';
+      if (!isObj(q) || ids.has(q.id) || describe(q).status === 'expired') return false;
+      // Discord's QuestCard crashes (e.g. "Cannot read property 'messages' of undefined") on a quest
+      // that lacks the data it renders, so only merge quests that have all of it.
+      if (!cardReady(q)) { skipped++; return false; }
+      return true;
     });
+    skippedHidden = skipped;
     if (extra.length === 0) return res;
     var merged = Object.assign({}, res, { quests: res.quests.concat(extra), excludedQuests: [] });
     mergedCache.set(res, merged);
@@ -259,6 +276,7 @@
         h(Design.TableRowGroup, { title: 'Status' },
           h(Design.TableRow, { label: d.storeFound ? 'Quest store found' : 'Quest store NOT found', subLabel: 'Open Discord\u2019s Quests screen once so everything loads.' }),
           h(Design.TableRow, { label: all.length + ' quests: ' + available.length + ' available, ' + all.filter(function (x) { return x.hidden; }).length + ' hidden by client' }),
+          !!skippedHidden && h(Design.TableRow, { label: skippedHidden + ' hidden quest(s) not merged into Discord’s list', subLabel: 'They are missing data Discord’s quest card needs. They are still listed below.' }),
           h(Design.TableRow, { label: em ? 'enrollInQuest found (args: ' + em.enrollInQuest.length + ')' : 'enrollInQuest not found' }),
           !!msgS[0] && h(Design.TableRow, { label: msgS[0] })),
 
