@@ -1,14 +1,20 @@
 {
-	"format": 1,
-	"id": "moon.quest-inspector",
-	"name": "Quest Inspector",
-	"description": "See every quest your Discord client has (including hidden ones), get alerts for new quests, and accept quests from one place.",
-	"author": "Moon",
-	"icon": "QuestsIcon",
-	"version": "0.1.0",
-	"dependencies": {
-		"valenced.api": { "version": ">=1 <2" },
-		"discord": { "version": "*" }
-	},
-	"dist": { "script": "index.js" }
+  "format": 1,
+  "id": "moon.quest-inspector",
+  "name": "Quest Inspector",
+  "description": "See every quest your Discord client has (including hidden ones), get alerts for new quests, and accept quests from one place.",
+  "author": "Moon",
+  "icon": "QuestsIcon",
+  "version": "0.1.1",
+  "dependencies": {
+    "valenced.api": {
+      "version": ">=1 <2"
+    },
+    "discord": {
+      "version": "*"
+    }
+  },
+  "dist": {
+    "script": "index.js"
+  }
 }
