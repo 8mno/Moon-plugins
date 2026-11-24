@@ -192,14 +192,21 @@
   }
 
   // ---------- Discord's own Quests screen: optionally show hidden quests ----------
+  // Keep the same merged object for the same hook result, so React consumers that put the
+  // result in effect/memo deps don't see a brand-new object on every render.
+  var mergedCache = new WeakMap();
   function mergeHidden(res) {
     if (!isObj(res) || !Array.isArray(res.quests) || !Array.isArray(res.excludedQuests) || res.excludedQuests.length === 0) return res;
+    var hit = mergedCache.get(res);
+    if (hit) return hit;
     var ids = new Set(res.quests.map(function (q) { return q && q.id; }));
     var extra = res.excludedQuests.filter(function (q) {
       return isObj(q) && !ids.has(q.id) && describe(q).status !== 'expired';
     });
     if (extra.length === 0) return res;
-    return Object.assign({}, res, { quests: res.quests.concat(extra), excludedQuests: [] });
+    var merged = Object.assign({}, res, { quests: res.quests.concat(extra), excludedQuests: [] });
+    mergedCache.set(res, merged);
+    return merged;
   }
 
   // ---------- settings UI ----------
@@ -226,7 +233,7 @@
     var view = applyView(all, c, qS[0]);
     var available = all.filter(function (x) { return x.status === 'available'; });
     var em = enrollModule();
-    var TI = Design.TextInput || RN.TextInput;
+    var TI = V.components.SearchInput || Design.TextInput || RN.TextInput;
     function onText(x) { qS[1](typeof x === 'string' ? x : ((x && x.nativeEvent && x.nativeEvent.text) || '')); }
 
     function openQuest(x) {
@@ -273,8 +280,9 @@
           }),
           h(Design.TableRow, { label: 'Share everything as JSON', subLabel: 'Raw quests plus store/hook keys. Useful for checking field names.', onPress: function () { share(safe(d), setMsg); } })),
 
+        // inputs go straight in the Page (like Valenced's own plugins), not inside a TableRowGroup
+        h(TI, { value: qS[0], placeholder: 'Search name, reward, game, type', size: 'md', onChange: onText, onChangeText: onText }),
         h(Design.TableRowGroup, { title: 'Find' },
-          h(TI, { value: qS[0], placeholder: 'Search name, reward, game, type', onChange: onText, onChangeText: onText }),
           h(Design.TableRow, { label: 'Filter: ' + c.filter, subLabel: 'Tap to cycle: ' + FILTERS.join(' / '), onPress: function () { set({ filter: cycle(FILTERS, c.filter) }); } })),
 
         h(Design.TableRowGroup, { title: 'Quests (' + view.length + ')' },

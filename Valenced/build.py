@@ -58,6 +58,11 @@ def files_for(folder, manifest):
     return sorted(set(rels))
 
 
+def zip_contents(path):
+    with zipfile.ZipFile(path) as z:
+        return {n: z.read(n) for n in z.namelist()}
+
+
 def build_zip(folder, manifest):
     out = os.path.join(POOL, f'{manifest["id"]}@{manifest["version"]}.zip')
     tmp = out + '.tmp'
@@ -69,7 +74,9 @@ def build_zip(folder, manifest):
             with open(os.path.join(folder, rel), 'rb') as f:
                 z.writestr(info, f.read())
     if os.path.exists(out):
-        if open(out, 'rb').read() != open(tmp, 'rb').read():
+        # Compare what is inside the zips, not the raw bytes: the compressed bytes depend on the
+        # zlib build of whatever machine runs this, so a byte comparison fails on unchanged plugins.
+        if zip_contents(out) != zip_contents(tmp):
             os.remove(tmp)
             raise SystemExit(f'{manifest["id"]} {manifest["version"]} is already published but its files changed. '
                              f'Bump "version" in plugins/{os.path.basename(folder)}/manifest.json.')
