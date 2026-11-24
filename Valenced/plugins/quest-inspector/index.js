@@ -1,10 +1,20 @@
 (function (exports) {
   var V = valenced;
-  var React = V.react.React;
-  var RN = V.react.ReactNative;
-  var Design = V.discord.design.Design;
-  var finders = V.modules.finders;
-  var h = React.createElement;
+
+  // Valenced evaluates this script *before* Discord's index module is initialized (preInit).
+  // Reading e.g. valenced.discord.design at that point throws, which kills the plugin at boot
+  // (it shows as disabled after a reload, with no settings gear). So nothing from the valenced
+  // API may be read while this file loads: every API object below is resolved on first use.
+  function lazy(get) {
+    return new Proxy({}, {
+      get: function (_, key) { return get()[key]; }
+    });
+  }
+  var React = lazy(function () { return V.react.React; });
+  var RN = lazy(function () { return V.react.ReactNative; });
+  var Design = lazy(function () { return V.discord.design.Design; });
+  var finders = lazy(function () { return V.modules.finders; });
+  function h() { return React.createElement.apply(null, arguments); }
 
   var DEFAULTS = {
     showHidden: false,   // merge client-excluded quests into Discord's own Quests screen
