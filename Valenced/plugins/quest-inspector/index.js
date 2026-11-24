@@ -350,7 +350,6 @@
       });
       cleanup(function () { if (timer) clearInterval(timer); });
     },
-    stop: function (ctx) { ctx.plugin.requireReload(); },
     SettingsComponent: Inspector
   });
   return exports;
