@@ -223,7 +223,10 @@
     var ids = new Set(res.quests.map(function (q) { return q && q.id; }));
     var skipped = 0;
     var extra = res.excludedQuests.filter(function (q) {
-      if (!isObj(q) || ids.has(q.id) || describe(q).status === 'expired') return false;
+      if (!isObj(q) || ids.has(q.id)) return false;
+      // only quests that are live right now: not expired, claimed or completed
+      var st = describe(q).status;
+      if (st !== 'available' && st !== 'enrolled') return false;
       // Discord's QuestCard crashes (e.g. "Cannot read property 'messages' of undefined") on a quest
       // that lacks the data it renders, so only merge quests that have all of it.
       if (!cardReady(q)) { skipped++; return false; }
