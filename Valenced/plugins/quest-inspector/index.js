@@ -27,6 +27,8 @@
     autoMeta: true,      // download quest names/details for hidden quests (about 5 MB, at most every 6 hours)
     meta: {},            // cached quest configs for hidden quests, see META_URLS
     metaAt: 0,
+    autoProbe: true,     // ask Discord (GET /quests/{id}) whether hidden quests are still active
+    gone: {},            // quest id -> when Discord said it is not active
     acceptDelay: 1500,   // ms between "Accept all" requests
     seeded: false,
     seen: []
@@ -44,6 +46,10 @@
   var META_RETRY_FAIL = 30 * 60 * 1000;
   var META_RETRY_OK = 6 * 3600 * 1000;
   var LIVE_STATUSES = ['available', 'unverified'];
+  var PROBE_MAX = 25;                      // quests asked about per run
+  var PROBE_MAX_AGE_DAYS = 60;             // older ids are not worth asking about
+  var PROBE_GONE_TTL = 24 * 3600 * 1000;   // how long "not active" is remembered
+  var PROBE_GAP = 500;                     // ms between requests
   var QUEST_HOME_MOBILE = 12;   // "location" Discord's accept request needs (QUEST_HOME_MOBILE)
   var DESKTOP_ONLY = ['PLAY_ON_DESKTOP', 'PLAY_ON_XBOX', 'PLAY_ON_PLAYSTATION', 'STREAM_ON_DESKTOP'];
   var TYPE_LABELS = {
@@ -190,6 +196,63 @@
     metaNextAt = Date.now() + META_RETRY_FAIL;
     loadMeta(false);
   }
+  // ---------- asking Discord whether a hidden quest is still active ----------
+  var goneMap = {};          // quest id -> timestamp of the last "not active" answer
+  var probeStatus = 'not run yet';
+  var probing = null;
+  var probeNextAt = 0;
+  function isGone(id) {
+    var t = own(goneMap, id);
+    return typeof t === 'number' && Date.now() - t < PROBE_GONE_TTL;
+  }
+  function probeCandidates() {
+    return stubIds().filter(function (id) { return !isGone(id) && idAgeDays(id) <= PROBE_MAX_AGE_DAYS; })
+      .sort(function (a, b) { return idAgeDays(a) - idAgeDays(b); });   // newest first
+  }
+  function loadProbe() {
+    if (probing) return probing;
+    probing = probeStubs().then(function (r) { probing = null; return r; }, function () { probing = null; return false; });
+    return probing;
+  }
+  // GET /quests/{id} should return the full config only while the quest is active (per the community
+  // docs; not confirmed for hidden quests, so the outcome counts are shown in Status).
+  async function probeStubs() {
+    var http = httpModule();
+    if (!http || typeof http.get !== 'function') { probeStatus = 'Discord HTTP client not found'; return false; }
+    var todo = probeCandidates();
+    if (todo.length === 0) { probeStatus = 'nothing to check'; probeNextAt = Date.now() + META_RETRY_OK; return false; }
+    var batch = todo.slice(0, PROBE_MAX), found = {}, gone = {}, n = { ok: 0, gone: 0, err: 0 }, lastErr = '';
+    probeStatus = 'checking ' + batch.length + '...';
+    for (var i = 0; i < batch.length; i++) {
+      try {
+        var res = await http.get({ url: '/quests/' + encodeURIComponent(batch[i]), retries: 0 });
+        var body = isObj(res) && isObj(res.body) ? res.body : res;
+        var cfg = isObj(body) && isObj(body.config) ? body.config : body;
+        if (isObj(cfg) && isObj(cfg.messages)) { found[batch[i]] = camelize(cfg); n.ok++; }
+        else { n.err++; lastErr = 'reply had no quest data'; }
+      } catch (e) {
+        if (isObj(e) && e.status === 404) { gone[batch[i]] = Date.now(); n.gone++; }
+        else {
+          n.err++; lastErr = errText(e);
+          if (isObj(e) && e.status === 429) break;
+        }
+      }
+      if (i < batch.length - 1) await sleep(PROBE_GAP);
+    }
+    if (n.ok) setMeta(Object.assign({}, metaMap, found), metaAt || Date.now());
+    Object.assign(goneMap, gone);
+    probeNextAt = Date.now() + (todo.length > batch.length ? 15 * 60000 : META_RETRY_OK);
+    probeStatus = n.ok + ' active, ' + n.gone + ' not active, ' + n.err + ' unclear' + (lastErr ? ' (' + lastErr + ')' : '');
+    try { if (storageRef) await storageRef.set({ meta: found, gone: gone }); } catch (e2) {}
+    return n.ok + n.gone > 0;
+  }
+  function maybeProbe() {
+    if (probing || metaLoading || Date.now() < probeNextAt || !cfgNow().autoProbe) return;
+    if (probeCandidates().length === 0) return;
+    probeNextAt = Date.now() + META_RETRY_FAIL;
+    loadProbe();
+  }
+
   // snowflake ids carry their creation time
   function idAgeDays(id) { return (Date.now() - (Math.floor(Number(id) / 4194304) + 1420070400000)) / 86400000; }
 
@@ -340,7 +403,7 @@
       : (us.enrolledAt || us.enrolled_at) ? 'enrolled' : 'available';
     out.known = isObj(cfg.messages);
     // a stub with no details has no expiry, so guess from the age of its id: quests last weeks, not months
-    if (!out.known && out.status === 'available') out.status = out.id && idAgeDays(out.id) <= 30 ? 'unverified' : 'old';
+    if (!out.known && out.status === 'available') out.status = isGone(out.id) ? 'gone' : (out.id && idAgeDays(out.id) <= 30 ? 'unverified' : 'old');
     return out;
   }
 
@@ -391,7 +454,7 @@
       if (f === 'live hidden' && !(x.hidden && (LIVE_STATUSES.indexOf(x.status) >= 0 || x.status === 'enrolled'))) return false;
       if (c.region === 'global' && regionKind(x.id) !== 'global') return false;
       if (c.region === 'regional' && regionKind(x.id) !== 'regional') return false;
-      if (f === 'finished' && ['claimed', 'completed', 'expired', 'old'].indexOf(x.status) < 0) return false;
+      if (f === 'finished' && ['claimed', 'completed', 'expired', 'old', 'gone'].indexOf(x.status) < 0) return false;
       if (query) {
         var hay = (x.name + ' ' + x.id + ' ' + x.reward + ' ' + x.app + ' ' + x.types.join(' ') + ' ' + regionHay(x.id)).toLowerCase();
         if (hay.indexOf(query.toLowerCase()) < 0) return false;
@@ -543,7 +606,7 @@
       if (LIVE_STATUSES.indexOf(x.status) >= 0) buttons.push({ text: 'Accept', onPress: function () { acceptList([x], setMsg); } });
       buttons.push({ text: 'Open in Discord', onPress: function () { RN.Linking.openURL('https://discord.com/quests/' + encodeURIComponent(x.id)); } });
       buttons.push({ text: 'Copy JSON', onPress: function () { copyText(safe(x.q), setMsg); } });
-      RN.Alert.alert(x.name, [x.status === 'unverified' ? 'unverified (no details yet)' : x.status === 'old' ? 'probably expired' : x.status, x.hidden ? 'hidden: ' + hiddenReason(x) : '', regionLabel(x.id, true), x.reward ? 'reward: ' + x.reward : '', timeLeft(x.expMs)].filter(Boolean).join('\n'), buttons);
+      RN.Alert.alert(x.name, [x.status === 'unverified' ? 'unverified (no details yet)' : x.status === 'old' ? 'probably expired' : x.status === 'gone' ? 'not active (Discord says)' : x.status, x.hidden ? 'hidden: ' + hiddenReason(x) : '', regionLabel(x.id, true), x.reward ? 'reward: ' + x.reward : '', timeLeft(x.expMs)].filter(Boolean).join('\n'), buttons);
     }
     var regionAge = regionsAt ? Math.max(0, Math.round((Date.now() - regionsAt) / 3600000)) + 'h ago' : 'never';
 
@@ -553,6 +616,7 @@
           h(Design.TableRow, { label: d.storeFound ? 'Quest store found' : 'Quest store NOT found', subLabel: 'Open Discord\u2019s Quests screen once so everything loads.' }),
           h(Design.TableRow, { label: all.length + ' quests: ' + live.length + ' available, ' + hiddenCount + ' hidden by client (' + liveHidden.length + ' hidden and available)' }),
           h(Design.TableRow, { label: 'Names: ' + (all.length - stubCount) + ' of ' + all.length + ' quests have details' + (stubCount ? ' (' + stubCount + ' only an id)' : ''), subLabel: 'Hidden quests arrive from Discord as bare ids. Details come from a community tracker (' + metaStatus + '). Quests newer than the tracker stay as ids. Tap to download.', onPress: function () { setMsg('Downloading quest details...'); loadMeta(true).then(function (okM) { setMsg(okM ? 'Quest details updated.' : 'Quest details: ' + metaStatus); }); } }),
+          h(Design.TableRow, { label: 'Live check: ' + probeStatus, subLabel: 'Asks Discord if each hidden quest is still active (newest 25 at a time). Tap to run now.', onPress: function () { setMsg('Checking with Discord...'); loadProbe().then(function () { setMsg('Live check: ' + probeStatus); }); } }),
           !!skippedHidden && h(Design.TableRow, { label: skippedHidden + ' hidden quest(s) not added to Discord\u2019s list', subLabel: 'No details for them yet, so Discord\u2019s quest card could not draw them.' }),
           h(Design.TableRow, { label: hasHttp ? 'Accept: Discord HTTP client found' : 'Accept: Discord HTTP client NOT found', subLabel: 'Open the Quests screen once if it is missing.' }),
           h(Design.TableRow, { label: 'Regions: ' + regionStatus, subLabel: 'Updated ' + regionAge + '. Community list, may be out of date. Tap to refresh.', onPress: function () { setMsg('Updating regions...'); loadRegions(true).then(function (okR) { setMsg(okR ? 'Regions updated.' : 'Regions: ' + regionStatus); }); } }),
@@ -561,6 +625,7 @@
         h(Design.TableRowGroup, { title: 'Options' },
           h(Design.TableSwitchRow, { label: 'Show live hidden quests in Discord\u2019s Quests screen', subLabel: 'Adds hidden quests that are available or accepted to the native list. Reload after changing.', value: !!c.showHidden, onValueChange: function (v) { set({ showHidden: v }); } }),
           h(Design.TableSwitchRow, { label: 'Download quest names automatically', subLabel: 'About 5 MB from GitHub, at most every 6 hours, only when hidden quests have no details.', value: !!c.autoMeta, onValueChange: function (v) { set({ autoMeta: v }); } }),
+          h(Design.TableSwitchRow, { label: 'Check hidden quests with Discord', subLabel: 'Small, spaced-out requests that confirm a quest is still active and fetch its name.', value: !!c.autoProbe, onValueChange: function (v) { set({ autoProbe: v }); } }),
           h(Design.TableSwitchRow, { label: 'Alert me about new quests', subLabel: 'Says when a new quest is a hidden one.', value: !!c.alertNew, onValueChange: function (v) { set({ alertNew: v }); } }),
           h(Design.TableSwitchRow, { label: 'Soonest-expiring first', value: !!c.sortSoonest, onValueChange: function (v) { set({ sortSoonest: v }); } }),
           h(Design.TableRow, { label: 'Delay between accepts: ' + (c.acceptDelay / 1000) + 's', subLabel: 'Tap to cycle 1s / 1.5s / 3s / 5s.', onPress: function () { set({ acceptDelay: cycle([1000, 1500, 3000, 5000], c.acceptDelay) }); } })),
@@ -604,7 +669,7 @@
                 var types = x.types.map(function (t) { return TYPE_LABELS[t] || t.toLowerCase(); }).join(', ');
                 return h(Design.TableRow, {
                   key: x.id, label: x.known ? x.name : 'Quest ' + x.id,
-                  subLabel: [x.status === 'unverified' ? 'unverified' : x.status === 'old' ? 'probably expired' : x.status, x.hidden ? 'hidden (' + hiddenReason(x) + ')' : '', regionLabel(x.id), x.app, types, x.reward ? 'reward: ' + x.reward : '', Number.isFinite(x.progress) && x.status === 'enrolled' ? x.progress + '%' : '', timeLeft(x.expMs)].filter(Boolean).join(' \u00b7 '),
+                  subLabel: [x.status === 'unverified' ? 'unverified' : x.status === 'old' ? 'probably expired' : x.status === 'gone' ? 'not active' : x.status, x.hidden ? 'hidden (' + hiddenReason(x) + ')' : '', regionLabel(x.id), x.app, types, x.reward ? 'reward: ' + x.reward : '', Number.isFinite(x.progress) && x.status === 'enrolled' ? x.progress + '%' : '', timeLeft(x.expMs)].filter(Boolean).join(' \u00b7 '),
                   onPress: function () { openQuest(x); }
                 });
               }))));
@@ -666,8 +731,9 @@
         var cs = cfgNow();
         if (isObj(cs.regions) && Object.keys(cs.regions).length) setRegions(cs.regions, Number(cs.regionsAt) || 0);
         if (isObj(cs.meta) && Object.keys(cs.meta).length) setMeta(cs.meta, Number(cs.metaAt) || 0);
+        if (isObj(cs.gone)) Object.keys(cs.gone).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.gone[k] === 'number') goneMap[k] = cs.gone[k]; });
         loadRegions(false);
-        timer = setInterval(function () { if (RN.AppState.currentState === 'active') { maybeMeta(); } check(); }, 8000);
+        timer = setInterval(function () { if (RN.AppState.currentState === 'active') { maybeMeta(); maybeProbe(); } check(); }, 8000);
         check();
       });
       cleanup(function () { if (timer) clearInterval(timer); });
