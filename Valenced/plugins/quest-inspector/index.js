@@ -289,6 +289,21 @@
     return why.length ? 'likely ' + why.join(' + ') : 'reason unknown';
   }
 
+  // How many of these quests each country unlocks, from the region list (quests limited by an
+  // exclude list only are open to most countries, so they are counted separately).
+  function countryCounts(list) {
+    var counts = Object.create(null), globalN = 0, open = 0, unknown = 0;
+    list.forEach(function (x) {
+      var r = regionFor(x.id);
+      if (!r) { unknown++; return; }
+      if (r.g) { globalN++; return; }
+      if (r.i.length) r.i.forEach(function (c) { counts[c] = (counts[c] || 0) + 1; });
+      else open++;
+    });
+    var top = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a] || (a < b ? -1 : 1); });
+    return { counts: counts, top: top, globalN: globalN, open: open, unknown: unknown };
+  }
+
   // ---------- reading quest objects (field names defensive; verify with the JSON export) ----------
   function describe(q) {
     var out = { id: '', name: 'unknown', status: 'available', types: [], expMs: NaN, reward: '', app: '', progress: NaN, known: false };
@@ -378,7 +393,7 @@
       if (c.region === 'regional' && regionKind(x.id) !== 'regional') return false;
       if (f === 'finished' && ['claimed', 'completed', 'expired', 'old'].indexOf(x.status) < 0) return false;
       if (query) {
-        var hay = (x.name + ' ' + x.reward + ' ' + x.app + ' ' + x.types.join(' ') + ' ' + regionHay(x.id)).toLowerCase();
+        var hay = (x.name + ' ' + x.id + ' ' + x.reward + ' ' + x.app + ' ' + x.types.join(' ') + ' ' + regionHay(x.id)).toLowerCase();
         if (hay.indexOf(query.toLowerCase()) < 0) return false;
       }
       return true;
@@ -504,6 +519,14 @@
     var liveHidden = live.filter(function (x) { return x.hidden; });
     var hiddenCount = all.filter(function (x) { return x.hidden; }).length;
     var hasHttp = !!httpModule();
+    var cc = countryCounts(liveHidden);
+    function showCountries() {
+      var lines = cc.top.map(function (code) { return flag(code, true) + ': ' + cc.counts[code]; });
+      if (cc.globalN) lines.push('\uD83C\uDF10 global: ' + cc.globalN);
+      if (cc.open) lines.push('limited only by an exclude list (open to most countries): ' + cc.open);
+      if (cc.unknown) lines.push('region unknown: ' + cc.unknown);
+      RN.Alert.alert('Live hidden quests by country', lines.length ? lines.join('\n') : 'Nothing to count yet.');
+    }
     var stubCount = all.filter(function (x) { return !x.known; }).length;
     var TI = V.components.SearchInput || Design.TextInput || RN.TextInput;
     function onText(x) { qS[1](typeof x === 'string' ? x : ((x && x.nativeEvent && x.nativeEvent.text) || '')); }
@@ -566,6 +589,11 @@
         // inputs go straight in the Page (like Valenced's own plugins), not inside a TableRowGroup
         h(TI, { value: qS[0], placeholder: 'Search name, reward, game, type, country code', size: 'md', onChange: onText, onChangeText: onText }),
         h(Design.TableRowGroup, { title: 'Find' },
+          h(Design.TableRow, {
+            label: cc.top.length ? 'Unlock by country: ' + cc.top.slice(0, 4).map(function (code) { return flag(code) + ' ' + cc.counts[code]; }).join('  ') : 'Unlock by country: no region data yet',
+            subLabel: liveHidden.length + ' live hidden quests. ' + (cc.globalN ? '\uD83C\uDF10 ' + cc.globalN + ' global. ' : '') + 'Tap for the full list.',
+            onPress: showCountries
+          }),
           h(Design.TableRow, { label: 'Filter: ' + c.filter, subLabel: 'Tap to cycle: ' + FILTERS.join(' / '), onPress: function () { set({ filter: cycle(FILTERS, c.filter) }); } }),
           h(Design.TableRow, { label: 'Region: ' + c.region, subLabel: 'Tap to cycle: ' + REGION_FILTERS.join(' / ') + '. You can also search a code like US or IQ.', onPress: function () { set({ region: cycle(REGION_FILTERS, c.region) }); } })),
 
@@ -626,7 +654,7 @@
             fresh.forEach(function (d) {
               if (['expired', 'claimed', 'completed'].indexOf(d.status) >= 0) return;
               var rl = regionLabel(d.id);
-              if (shown++ < 3) toast('QI_NEW_' + d.id, (d.hidden ? 'New hidden quest: ' : 'New quest: ') + d.name + (d.reward ? ' (' + d.reward + ')' : '') + (rl ? ' ' + rl : ''));
+              if (shown++ < 3) toast('QI_NEW_' + d.id, (d.hidden ? 'New hidden quest: ' : 'New quest: ') + (d.known ? d.name : 'no details yet') + (d.reward ? ' (' + d.reward + ')' : '') + (rl ? ' ' + rl : ''));
             });
             if (shown > 3) toast('QI_NEW_MORE', '+' + (shown - 3) + ' more new quests');
           }
