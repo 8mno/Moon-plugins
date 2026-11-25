@@ -20,12 +20,22 @@
     showHidden: false,   // merge client-excluded quests into Discord's own Quests screen
     alertNew: true,      // toast when a new quest appears
     sortSoonest: true,   // soonest-expiring first
-    filter: 'all',       // all | available | enrolled | hidden | finished
+    filter: 'live hidden', // live hidden | all | available | enrolled | hidden | finished
+    region: 'any',       // any | global | regional
+    regions: {},         // cached region data, see REGIONS_URL
+    regionsAt: 0,
     acceptDelay: 1500,   // ms between "Accept all" requests
     seeded: false,
     seen: []
   };
-  var FILTERS = ['all', 'available', 'enrolled', 'hidden', 'finished'];
+  var FILTERS = ['live hidden', 'all', 'available', 'enrolled', 'hidden', 'finished'];
+  var REGION_FILTERS = ['any', 'global', 'regional'];
+  // Third-party, community-kept list of which countries each quest is limited to. It is only used
+  // for display, can be out of date, and the plugin works without it.
+  var REGIONS_URL = 'https://gist.githubusercontent.com/xGustavvo/3d08b7369eb34b50834815fd43176cae/raw';
+  var REGIONS_TTL = 6 * 3600 * 1000;
+  var QUEST_HOME_MOBILE = 12;   // "location" Discord's accept request needs (QUEST_HOME_MOBILE)
+  var DESKTOP_ONLY = ['PLAY_ON_DESKTOP', 'PLAY_ON_XBOX', 'PLAY_ON_PLAYSTATION', 'STREAM_ON_DESKTOP'];
   var TYPE_LABELS = {
     WATCH_VIDEO: 'watch video', WATCH_VIDEO_ON_MOBILE: 'watch video (mobile)',
     PLAY_ON_DESKTOP: 'play on desktop', PLAY_ON_XBOX: 'play on Xbox',
@@ -55,9 +65,16 @@
       }, 2);
     } catch (e) { return 'unserializable: ' + (e && e.message); }
   }
-  function share(text, setMsg) {
+  // The share sheet silently fails for big payloads on some builds, so copy to the clipboard first.
+  function copyText(text, setMsg) {
+    try {
+      V.externals.ReactNativeClipboard.Clipboard.setString(text);
+      setMsg('Copied ' + text.length + ' characters to the clipboard.');
+      toast('QI_COPIED', 'Copied to clipboard');
+      return;
+    } catch (e) {}
     try { RN.Share.share({ message: text }); }
-    catch (e) { setMsg('Could not open share sheet.'); }
+    catch (e2) { setMsg('Could not copy or share.'); }
   }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   function toast(key, text, bad) {
@@ -86,9 +103,105 @@
     return m + 'm left';
   }
 
+  // ---------- regions ----------
+  var regionMap = {};       // quest id -> { g: isGlobal, i: [include], e: [exclude], a: ageGate, r: replacementId }
+  var replacedBy = {};      // replacement id -> record
+  var regionsAt = 0;
+  var regionStatus = 'not loaded';
+
+  function codeList(x) { return Array.isArray(x) ? x.filter(function (c) { return typeof c === 'string' && c.length <= 8; }) : []; }
+  function parseRegions(json) {
+    var list = isObj(json) && Array.isArray(json.quests) ? json.quests : [];
+    var out = {}, n = 0;
+    list.forEach(function (r) {
+      if (!isObj(r) || typeof r.id !== 'string' || !/^\d{5,25}$/.test(r.id)) return;
+      var inc = [], exc = [];
+      if (Array.isArray(r.regions)) inc = codeList(r.regions);
+      else if (isObj(r.regions)) { inc = codeList(r.regions.include); exc = codeList(r.regions.exclude); }
+      var rid = typeof r.replacement_id === 'string' && /^\d{5,25}$/.test(r.replacement_id) ? r.replacement_id : '';
+      out[r.id] = { g: r.is_global === true, i: inc, e: exc, a: r.show_age_gate === true, r: rid };
+      n++;
+    });
+    return n > 0 ? out : null;
+  }
+  function setRegions(map, at) {
+    // the map may come back from storage, so re-check every record instead of trusting its shape
+    var clean = {};
+    Object.keys(map).forEach(function (k) {
+      var r = map[k];
+      if (!/^\d{5,25}$/.test(k) || !isObj(r) || !Array.isArray(r.i) || !Array.isArray(r.e)) return;
+      clean[k] = { g: r.g === true, i: codeList(r.i), e: codeList(r.e), a: r.a === true, r: typeof r.r === 'string' && /^\d{5,25}$/.test(r.r) ? r.r : '' };
+    });
+    regionMap = clean; regionsAt = at; replacedBy = {};
+    Object.keys(clean).forEach(function (k) { if (clean[k].r) replacedBy[clean[k].r] = clean[k]; });
+    regionStatus = Object.keys(clean).length + ' quests';
+  }
+  var regionsLoading = null;
+  function loadRegions(force) {
+    if (!force && regionsAt && Date.now() - regionsAt < REGIONS_TTL) return Promise.resolve(false);
+    if (!regionsLoading) {
+      regionsLoading = fetchRegions().then(function (r) { regionsLoading = null; return r; });
+    }
+    return regionsLoading;
+  }
+  async function fetchRegions() {
+    regionStatus = 'loading...';
+    var map;
+    try {
+      var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+      var t = ctrl ? setTimeout(function () { ctrl.abort(); }, 15000) : null;
+      var res = await fetch(REGIONS_URL, ctrl ? { signal: ctrl.signal } : undefined);
+      if (t) clearTimeout(t);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      map = parseRegions(await res.json());
+      if (!map) throw new Error('unexpected format');
+    } catch (e) {
+      regionStatus = 'failed: ' + (e && e.message ? e.message : e);
+      return false;
+    }
+    setRegions(map, Date.now());
+    try { if (storageRef) await storageRef.set({ regions: map, regionsAt: regionsAt }); } catch (e) {}
+    return true;
+  }
+  function own(o, k) { return Object.prototype.hasOwnProperty.call(o, k) ? o[k] : null; }
+  function regionFor(id) { return own(regionMap, id) || own(replacedBy, id) || null; }
+  function regionKind(id) { var r = regionFor(id); return !r ? 'unknown' : r.g ? 'global' : 'regional'; }
+  function flag(code, withCode) {
+    var c = String(code).toUpperCase();
+    if (c === 'UK') c = 'GB';
+    if (!/^[A-Z]{2}$/.test(c)) return String(code);
+    var f = String.fromCodePoint(0x1F1E6 + c.charCodeAt(0) - 65, 0x1F1E6 + c.charCodeAt(1) - 65);
+    return withCode ? f + ' ' + c : f;
+  }
+  function flags(list, max, withCode) {
+    var s = list.slice(0, max).map(function (c) { return flag(c, withCode); }).join(withCode ? ', ' : ' ');
+    return list.length > max ? s + ' +' + (list.length - max) : s;
+  }
+  function regionLabel(id, long) {
+    var r = regionFor(id);
+    if (!r) return regionsAt ? '\u2754 region unknown' : '';
+    var age = r.a ? ' \uD83D\uDD1E' : '';
+    if (r.g) return '\uD83C\uDF10 global' + age;
+    var parts = [];
+    if (r.i.length) parts.push('only ' + flags(r.i, long ? 99 : 6, long));
+    if (r.e.length) parts.push('not ' + flags(r.e, long ? 99 : 6, long));
+    if (!parts.length) parts.push('\uD83D\uDD12 region-limited');
+    return parts.join(' \u00b7 ') + age;
+  }
+  function regionHay(id) {
+    var r = regionFor(id);
+    return r ? (r.g ? 'global' : 'regional ' + r.i.concat(r.e).join(' ')) : '';
+  }
+  function hiddenReason(x) {
+    var why = [];
+    if (regionKind(x.id) === 'regional') why.push('region-limited');
+    if (x.types.length && x.types.every(function (t) { return DESKTOP_ONLY.indexOf(t) >= 0; })) why.push('needs desktop/console');
+    return why.length ? 'likely ' + why.join(' + ') : 'reason unknown';
+  }
+
   // ---------- reading quest objects (field names defensive; verify with the JSON export) ----------
   function describe(q) {
-    var out = { id: '', name: 'unknown', status: 'available', types: [], expMs: NaN, reward: '', app: '' };
+    var out = { id: '', name: 'unknown', status: 'available', types: [], expMs: NaN, reward: '', app: '', progress: NaN };
     if (!isObj(q)) return out;
     var cfg = isObj(q.config) ? q.config : {};
     var msgs = isObj(cfg.messages) ? cfg.messages : {};
@@ -102,6 +215,19 @@
     out.expMs = Date.parse(cfg.expiresAt || cfg.expires_at);
     out.types = isObj(tc) && isObj(tc.tasks) ? Object.keys(tc.tasks) : [];
     out.reward = rm.name || rm.nameWithArticle || rm.name_with_article || '';
+    var orbs = rw ? Number(rw.orbQuantity || rw.orb_quantity) : NaN;
+    if (!out.reward && orbs > 0) out.reward = orbs + ' orbs';
+    var tasks = isObj(tc) && isObj(tc.tasks) ? tc.tasks : null;
+    var prog = isObj(us.progress) ? us.progress : null;
+    if (tasks && prog) {
+      var sum = 0, n = 0;
+      Object.keys(tasks).forEach(function (k) {
+        var target = isObj(tasks[k]) ? Number(tasks[k].target) : NaN;
+        if (!(target > 0)) return;
+        sum += Math.min((isObj(prog[k]) ? Number(prog[k].value) || 0 : 0) / target, 1); n++;
+      });
+      if (n) out.progress = Math.round(sum / n * 100);
+    }
     out.app = isObj(cfg.application) && typeof cfg.application.name === 'string' ? cfg.application.name : '';
     out.status = (us.claimedAt || us.claimed_at) ? 'claimed'
       : (us.completedAt || us.completed_at) ? 'completed'
@@ -154,9 +280,12 @@
       if (f === 'available' && x.status !== 'available') return false;
       if (f === 'enrolled' && x.status !== 'enrolled') return false;
       if (f === 'hidden' && !x.hidden) return false;
+      if (f === 'live hidden' && !(x.hidden && (x.status === 'available' || x.status === 'enrolled'))) return false;
+      if (c.region === 'global' && regionKind(x.id) !== 'global') return false;
+      if (c.region === 'regional' && regionKind(x.id) !== 'regional') return false;
       if (f === 'finished' && ['claimed', 'completed', 'expired'].indexOf(x.status) < 0) return false;
       if (query) {
-        var hay = (x.name + ' ' + x.reward + ' ' + x.app + ' ' + x.types.join(' ')).toLowerCase();
+        var hay = (x.name + ' ' + x.reward + ' ' + x.app + ' ' + x.types.join(' ') + ' ' + regionHay(x.id)).toLowerCase();
         if (hay.indexOf(query.toLowerCase()) < 0) return false;
       }
       return true;
@@ -172,33 +301,44 @@
   }
 
   // ---------- accepting ----------
+  function httpModule() {
+    var r = finders.lookupModule(finders.filters.withProps('HTTP'));
+    var m = r && r[0];
+    return m && isObj(m.HTTP) && typeof m.HTTP.post === 'function' ? m.HTTP : null;
+  }
   function errText(e) {
     if (!isObj(e)) return 'Request failed.';
     var body = isObj(e.body) ? e.body : {};
-    var st = typeof e.status === 'number' ? ' HTTP ' + e.status : '';
+    var st = typeof e.status === 'number' ? 'HTTP ' + e.status + ': ' : '';
     var m = typeof body.message === 'string' ? body.message : (typeof e.message === 'string' ? e.message : 'Request failed.');
-    return 'Accept failed' + st + ': ' + m;
+    var code = typeof body.code === 'number' ? ' (code ' + body.code + ')' : '';
+    return st + m + code;
   }
-  // Same action as Discord's own "Accept quest" button. Sends no progress.
-  async function acceptOne(m, x) {
-    await m.enrollInQuest(x.id, {});
+  // The accept request Discord's own button sends: POST /quests/{id}/enroll with a "location".
+  // The server's reply carries enrolled_at, and that is the only thing counted as success.
+  async function enrollOne(x) {
+    var http = httpModule();
+    if (!http) throw new Error('Discord\u2019s HTTP client was not found. Open the Quests screen once and retry.');
+    var res = await http.post({ url: '/quests/' + encodeURIComponent(x.id) + '/enroll', body: { location: QUEST_HOME_MOBILE }, retries: 0 });
+    if (isObj(res) && (res.ok === false || (typeof res.status === 'number' && res.status >= 400))) throw res;
+    var body = isObj(res) && isObj(res.body) ? res.body : res;
+    if (!isObj(body) || !(body.enrolled_at || body.enrolledAt)) throw new Error('Server reply had no enrolled_at, so this was not confirmed.');
   }
   async function acceptList(list, setMsg) {
-    var m = enrollModule();
-    if (!m) { setMsg('enrollInQuest not found. Open the Quests screen first.'); return; }
     var ok = 0, fail = [], delay = cfgNow().acceptDelay;
     for (var i = 0; i < list.length; i++) {
       setMsg('Accepting ' + (i + 1) + '/' + list.length + ': ' + list[i].name + '...');
-      try { await acceptOne(m, list[i]); ok++; }
+      try { await enrollOne(list[i]); ok++; }
       catch (e) {
-        var t = errText(e);
-        fail.push(list[i].name + ' (' + t.replace('Accept failed', '').replace(/^:? ?/, '') + ')');
+        fail.push(list[i].name + ' [' + errText(e) + ']');
         if (isObj(e) && e.status === 429) { fail.push('Rate limited, stopped.'); break; }
       }
       if (i < list.length - 1) await sleep(delay);
     }
-    try { await m.fetchCurrentQuests(); } catch (e) {}
-    setMsg('Accepted ' + ok + '/' + list.length + (fail.length ? '. Failed: ' + fail.join('; ') : '.'));
+    var m = enrollModule();
+    if (m) { try { await m.fetchCurrentQuests(); } catch (e) {} }
+    setMsg('Server confirmed ' + ok + '/' + list.length + (fail.length ? '. Failed: ' + fail.join('; ') : '.'));
+    toast('QI_ACCEPT', ok + '/' + list.length + ' quests enrolled', ok === 0 && list.length > 0);
   }
 
   // ---------- Discord's own Quests screen: optionally show hidden quests ----------
@@ -261,45 +401,55 @@
     var d = collect();
     var all = unify(d);
     var view = applyView(all, c, qS[0]);
-    var available = all.filter(function (x) { return x.status === 'available'; });
-    var em = enrollModule();
+    var live = all.filter(function (x) { return x.status === 'available'; });
+    var liveHidden = live.filter(function (x) { return x.hidden; });
+    var hiddenCount = all.filter(function (x) { return x.hidden; }).length;
+    var hasHttp = !!httpModule();
     var TI = V.components.SearchInput || Design.TextInput || RN.TextInput;
     function onText(x) { qS[1](typeof x === 'string' ? x : ((x && x.nativeEvent && x.nativeEvent.text) || '')); }
 
+    function confirmAccept(list, title) {
+      if (busyS[0] || list.length === 0) return;
+      RN.Alert.alert(title, 'Each request goes to Discord and is only counted if the server confirms it.', [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Accept', onPress: function () { busyS[1](true); acceptList(list, setMsg).finally(function () { busyS[1](false); }); } }
+      ]);
+    }
     function openQuest(x) {
       var buttons = [];
       if (x.status === 'available') buttons.push({ text: 'Accept', onPress: function () { acceptList([x], setMsg); } });
       buttons.push({ text: 'Open in Discord', onPress: function () { RN.Linking.openURL('https://discord.com/quests/' + encodeURIComponent(x.id)); } });
-      buttons.push({ text: 'Share JSON', onPress: function () { share(safe(x.q), setMsg); } });
-      RN.Alert.alert(x.name, [x.status, x.hidden ? 'hidden by client' : '', x.reward ? 'reward: ' + x.reward : '', timeLeft(x.expMs)].filter(Boolean).join(' · '), buttons);
+      buttons.push({ text: 'Copy JSON', onPress: function () { copyText(safe(x.q), setMsg); } });
+      RN.Alert.alert(x.name, [x.status, x.hidden ? 'hidden: ' + hiddenReason(x) : '', regionLabel(x.id, true), x.reward ? 'reward: ' + x.reward : '', timeLeft(x.expMs)].filter(Boolean).join('\n'), buttons);
     }
+    var regionAge = regionsAt ? Math.max(0, Math.round((Date.now() - regionsAt) / 3600000)) + 'h ago' : 'never';
 
     return h(RN.ScrollView, { style: { flex: 1 }, contentContainerStyle: { paddingBottom: 24 } },
       h(V.components.Page, null,
         h(Design.TableRowGroup, { title: 'Status' },
           h(Design.TableRow, { label: d.storeFound ? 'Quest store found' : 'Quest store NOT found', subLabel: 'Open Discord\u2019s Quests screen once so everything loads.' }),
-          h(Design.TableRow, { label: all.length + ' quests: ' + available.length + ' available, ' + all.filter(function (x) { return x.hidden; }).length + ' hidden by client' }),
-          !!skippedHidden && h(Design.TableRow, { label: skippedHidden + ' hidden quest(s) not merged into Discord’s list', subLabel: 'They are missing data Discord’s quest card needs. They are still listed below.' }),
-          h(Design.TableRow, { label: em ? 'enrollInQuest found (args: ' + em.enrollInQuest.length + ')' : 'enrollInQuest not found' }),
+          h(Design.TableRow, { label: all.length + ' quests: ' + live.length + ' available, ' + hiddenCount + ' hidden by client (' + liveHidden.length + ' hidden and available)' }),
+          !!skippedHidden && h(Design.TableRow, { label: skippedHidden + ' hidden quest(s) not merged into Discord\u2019s list', subLabel: 'They are missing data Discord\u2019s quest card needs. They are still listed below.' }),
+          h(Design.TableRow, { label: hasHttp ? 'Accept: Discord HTTP client found' : 'Accept: Discord HTTP client NOT found', subLabel: 'Open the Quests screen once if it is missing.' }),
+          h(Design.TableRow, { label: 'Regions: ' + regionStatus, subLabel: 'Updated ' + regionAge + '. Community list, may be out of date. Tap to refresh.', onPress: function () { setMsg('Updating regions...'); loadRegions(true).then(function (okR) { setMsg(okR ? 'Regions updated.' : 'Regions: ' + regionStatus); }); } }),
           !!msgS[0] && h(Design.TableRow, { label: msgS[0] })),
 
         h(Design.TableRowGroup, { title: 'Options' },
-          h(Design.TableSwitchRow, { label: 'Show hidden quests in Discord\u2019s Quests screen', subLabel: 'Merges client-excluded quests into the native list. Reload after changing.', value: !!c.showHidden, onValueChange: function (v) { set({ showHidden: v }); } }),
-          h(Design.TableSwitchRow, { label: 'Alert me about new quests', value: !!c.alertNew, onValueChange: function (v) { set({ alertNew: v }); } }),
+          h(Design.TableSwitchRow, { label: 'Show live hidden quests in Discord\u2019s Quests screen', subLabel: 'Adds hidden quests that are available or accepted to the native list. Reload after changing.', value: !!c.showHidden, onValueChange: function (v) { set({ showHidden: v }); } }),
+          h(Design.TableSwitchRow, { label: 'Alert me about new quests', subLabel: 'Says when a new quest is a hidden one.', value: !!c.alertNew, onValueChange: function (v) { set({ alertNew: v }); } }),
           h(Design.TableSwitchRow, { label: 'Soonest-expiring first', value: !!c.sortSoonest, onValueChange: function (v) { set({ sortSoonest: v }); } }),
           h(Design.TableRow, { label: 'Delay between accepts: ' + (c.acceptDelay / 1000) + 's', subLabel: 'Tap to cycle 1s / 1.5s / 3s / 5s.', onPress: function () { set({ acceptDelay: cycle([1000, 1500, 3000, 5000], c.acceptDelay) }); } })),
 
         h(Design.TableRowGroup, { title: 'Actions' },
           h(Design.TableRow, {
-            label: 'Accept all available (' + available.length + ')',
-            subLabel: 'Accepts one by one, with the delay above. Same as tapping Accept in Discord.',
-            onPress: function () {
-              if (busyS[0] || available.length === 0) return;
-              RN.Alert.alert('Accept ' + available.length + ' quests?', 'Each one is accepted like the normal Accept button.', [
-                { text: 'Cancel', style: 'cancel' },
-                { text: 'Accept all', onPress: function () { busyS[1](true); acceptList(available, setMsg).finally(function () { busyS[1](false); }); } }
-              ]);
-            }
+            label: 'Accept all live hidden (' + liveHidden.length + ')',
+            subLabel: 'Only hidden quests that are available now. Skips expired, accepted and finished ones.',
+            onPress: function () { confirmAccept(liveHidden, 'Accept ' + liveHidden.length + ' hidden quests?'); }
+          }),
+          h(Design.TableRow, {
+            label: 'Accept all available (' + live.length + ')',
+            subLabel: 'Every quest you have not accepted yet, hidden or not.',
+            onPress: function () { confirmAccept(live, 'Accept ' + live.length + ' quests?'); }
           }),
           h(Design.TableRow, {
             label: 'Refresh quests from Discord',
@@ -309,12 +459,13 @@
               Promise.resolve(m.fetchCurrentQuests()).then(function () { setMsg('Refreshed.'); }, function () { setMsg('Refresh failed.'); });
             }
           }),
-          h(Design.TableRow, { label: 'Share everything as JSON', subLabel: 'Raw quests plus store/hook keys. Useful for checking field names.', onPress: function () { share(safe(d), setMsg); } })),
+          h(Design.TableRow, { label: 'Copy everything as JSON', subLabel: 'Raw quests plus store/hook keys, copied to the clipboard.', onPress: function () { copyText(safe(d), setMsg); } })),
 
         // inputs go straight in the Page (like Valenced's own plugins), not inside a TableRowGroup
-        h(TI, { value: qS[0], placeholder: 'Search name, reward, game, type', size: 'md', onChange: onText, onChangeText: onText }),
+        h(TI, { value: qS[0], placeholder: 'Search name, reward, game, type, country code', size: 'md', onChange: onText, onChangeText: onText }),
         h(Design.TableRowGroup, { title: 'Find' },
-          h(Design.TableRow, { label: 'Filter: ' + c.filter, subLabel: 'Tap to cycle: ' + FILTERS.join(' / '), onPress: function () { set({ filter: cycle(FILTERS, c.filter) }); } })),
+          h(Design.TableRow, { label: 'Filter: ' + c.filter, subLabel: 'Tap to cycle: ' + FILTERS.join(' / '), onPress: function () { set({ filter: cycle(FILTERS, c.filter) }); } }),
+          h(Design.TableRow, { label: 'Region: ' + c.region, subLabel: 'Tap to cycle: ' + REGION_FILTERS.join(' / ') + '. You can also search a code like US or IQ.', onPress: function () { set({ region: cycle(REGION_FILTERS, c.region) }); } })),
 
         h(Design.TableRowGroup, { title: 'Quests (' + view.length + ')' },
           view.length === 0
@@ -323,7 +474,7 @@
                 var types = x.types.map(function (t) { return TYPE_LABELS[t] || t.toLowerCase(); }).join(', ');
                 return h(Design.TableRow, {
                   key: x.id, label: x.name,
-                  subLabel: [x.status, x.hidden ? 'hidden by client' : '', types, x.reward ? 'reward: ' + x.reward : '', timeLeft(x.expMs)].filter(Boolean).join(' \u00b7 '),
+                  subLabel: [x.status, x.hidden ? 'hidden (' + hiddenReason(x) + ')' : '', regionLabel(x.id), types, x.reward ? 'reward: ' + x.reward : '', Number.isFinite(x.progress) && x.status === 'enrolled' ? x.progress + '%' : '', timeLeft(x.expMs)].filter(Boolean).join(' \u00b7 '),
                   onPress: function () { openQuest(x); }
                 });
               }))));
@@ -362,20 +513,18 @@
           if (RN.AppState.currentState !== 'active') return;
           var c = cfgNow();
           if (!c.alertNew) return;
-          var s = getStore();
-          if (!s) return;
-          var quests = toList(s.quests).filter(function (q) { return isObj(q) && typeof q.id === 'string'; });
+          var quests = unify(collect());
           if (quests.length === 0) return;
           if (!seenMemo) seenMemo = new Set(c.seen);
-          var fresh = quests.filter(function (q) { return !seenMemo.has(q.id); });
+          var fresh = quests.filter(function (x) { return !seenMemo.has(x.id); });
           if (fresh.length === 0) return;
-          fresh.forEach(function (q) { seenMemo.add(q.id); });
+          fresh.forEach(function (x) { seenMemo.add(x.id); });
           if (c.seeded) {
             var shown = 0;
-            fresh.forEach(function (q) {
-              var d = describe(q);
+            fresh.forEach(function (d) {
               if (['expired', 'claimed', 'completed'].indexOf(d.status) >= 0) return;
-              if (shown++ < 3) toast('QI_NEW_' + q.id, 'New quest: ' + d.name + (d.reward ? ' (' + d.reward + ')' : ''));
+              var rl = regionLabel(d.id);
+              if (shown++ < 3) toast('QI_NEW_' + d.id, (d.hidden ? 'New hidden quest: ' : 'New quest: ') + d.name + (d.reward ? ' (' + d.reward + ')' : '') + (rl ? ' ' + rl : ''));
             });
             if (shown > 3) toast('QI_NEW_MORE', '+' + (shown - 3) + ' more new quests');
           }
@@ -384,6 +533,9 @@
       }
       var timer = null;
       Promise.resolve(ctx.jsonStorage.get()).catch(function () {}).then(function () {
+        var cs = cfgNow();
+        if (isObj(cs.regions) && Object.keys(cs.regions).length) setRegions(cs.regions, Number(cs.regionsAt) || 0);
+        loadRegions(false);
         timer = setInterval(check, 8000);
         check();
       });
