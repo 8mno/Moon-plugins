@@ -706,7 +706,7 @@
       if (okNames.length) lines.push('Accepted:\n' + okNames.slice(0, 8).map(function (n) { return '\u2022 ' + n; }).join('\n'));
       if (fail.length) lines.push('Refused:\n' + fail.slice(0, 5).map(function (n) { return '\u2022 ' + n; }).join('\n'));
       if (lockedCount) lines.push('Discord does not offer ' + (lockedCount === 1 ? 'this quest' : 'these quests') + ' in your region. Turn on a VPN in one of its countries, then tap \u201cRetry refused quests\u201d.');
-      RN.Alert.alert(ok === list.length ? 'All ' + ok + ' accepted' : ok + ' of ' + list.length + ' accepted', lines.join('\n\n'));
+      popup(ok === list.length ? 'All ' + ok + ' accepted' : ok + ' of ' + list.length + ' accepted', lines.join('\n\n'));
     } catch (e) { /* the toast and the message row already said it */ }
   }
 
@@ -756,6 +756,28 @@
 
   // ---------- settings UI ----------
   var VPN_OK = VPN_LINKS.filter(function (v) { return v && typeof v.name === 'string' && typeof v.url === 'string' && /^https:\/\/[^\s]+$/.test(v.url); });
+  // Discord-styled popup (the same AlertModal Valenced uses), with the plain system alert as a fallback.
+  // buttons: [{ text, style: 'cancel' | 'destructive', onPress }]. The first non-cancel button is the main one.
+  var popupSeq = 0;
+  function popup(title, message, buttons) {
+    var list = Array.isArray(buttons) && buttons.length ? buttons : [{ text: 'Close', style: 'cancel' }];
+    try {
+      var D = Design, AC = V.discord.actions.AlertActionCreators;
+      if (!D.AlertModal || !D.AlertActionButton || !D.Text || !AC || typeof AC.openAlert !== 'function') throw new Error('no alert modal');
+      var key = 'QI_POPUP_' + (++popupSeq), mainDone = false;
+      var actions = list.map(function (b, i) {
+        var variant = b.style === 'cancel' ? 'secondary' : b.style === 'destructive' ? 'destructive' : (!mainDone && (mainDone = true)) ? 'primary' : 'secondary';
+        return h(D.AlertActionButton, { key: i, variant: variant, text: b.text, onPress: function () { if (b.onPress) { try { b.onPress(); } catch (e) {} } } });
+      });
+      AC.openAlert(key, h(D.AlertModal, {
+        title: String(title),
+        content: h(D.Text, { variant: 'text-md/medium', color: 'text-default' }, String(message || '')),
+        actions: h(React.Fragment, null, actions)
+      }));
+    } catch (e) {
+      RN.Alert.alert(String(title), String(message || ''), list.map(function (b) { return { text: b.text, style: b.style, onPress: b.onPress }; }));
+    }
+  }
   function bar(pct) { var n = Math.max(0, Math.min(10, Math.round(pct / 10))); return '\u25B0'.repeat(n) + '\u25B1'.repeat(10 - n); }
   var STATUS_ICON = { available: '\uD83D\uDFE2', unverified: '\uD83D\uDFE1', enrolled: '\u2705', completed: '\uD83C\uDFC1', claimed: '\uD83C\uDF81', expired: '\u231B', gone: '\u231B', old: '\u231B', locked: '\uD83D\uDD12' };
   var STATUS_WORD = { available: 'available', unverified: 'unverified', enrolled: 'accepted', completed: 'completed', claimed: 'claimed', expired: 'expired', gone: 'expired', old: 'probably expired', locked: 'not offered to you' };
@@ -800,7 +822,7 @@
       if (cc.globalN) lines.push('\uD83C\uDF10 global: ' + cc.globalN);
       if (cc.open) lines.push('limited only by an exclude list (open to most countries): ' + cc.open);
       if (cc.unknown) lines.push('region unknown: ' + cc.unknown);
-      RN.Alert.alert('Live hidden quests by country', lines.length ? lines.join('\n') : 'Nothing to count yet.');
+      popup('Live hidden quests by country', lines.length ? lines.join('\n') : 'Nothing to count yet.');
     }
     var lockedN = all.filter(function (x) { return x.status === 'locked'; }).length;
     var goneN = all.filter(function (x) { return x.status === 'gone'; }).length;
@@ -814,7 +836,7 @@
         setMsg('Nothing to accept. ' + (lockedN ? lockedN + ' quest(s) were refused by Discord as unknown, which usually means they are not offered to your region or account. ' : '') + (goneN ? goneN + ' have expired. ' : '') + 'Tap \u201cRetry refused quests\u201d after changing region.');
         return;
       }
-      RN.Alert.alert(title, shortList(list, 8) + '\n\nEach one is only counted if Discord confirms it.', [
+      popup(title, shortList(list, 8) + '\n\nEach one is only counted if Discord confirms it.', [
         { text: 'Cancel', style: 'cancel' },
         { text: 'Accept', onPress: function () { busyS[1](true); acceptList(list, setMsg).finally(function () { busyS[1](false); }); } }
       ]);
@@ -824,7 +846,7 @@
       if (LIVE_STATUSES.indexOf(x.status) >= 0 || x.status === 'locked') buttons.push({ text: x.status === 'locked' ? 'Try accept anyway' : 'Accept', onPress: function () { acceptList([x], setMsg); } });
       buttons.push({ text: 'Open in Discord', onPress: function () { RN.Linking.openURL('https://discord.com/quests/' + encodeURIComponent(x.id)); } });
       buttons.push({ text: 'Copy JSON', onPress: function () { copyText(safe(x.q), setMsg); } });
-      RN.Alert.alert(statusIcon(x) + ' ' + (x.known ? x.name : 'Quest ' + x.id), [statusWord(x) + (x.status === 'locked' ? ' (Discord says unknown quest)' : x.status === 'unverified' ? ' (no details yet)' : ''), x.reward ? 'Reward: ' + x.reward : '', x.app ? 'Game: ' + x.app : '', timeLeft(x.expMs), regionLabel(x.id, true), x.hidden ? 'Hidden: ' + hiddenReason(x) : ''].filter(Boolean).join('\n'), buttons);
+      popup(statusIcon(x) + ' ' + (x.known ? x.name : 'Quest ' + x.id), [statusWord(x) + (x.status === 'locked' ? ' (Discord says unknown quest)' : x.status === 'unverified' ? ' (no details yet)' : ''), x.reward ? 'Reward: ' + x.reward : '', x.app ? 'Game: ' + x.app : '', timeLeft(x.expMs), regionLabel(x.id, true), x.hidden ? 'Hidden: ' + hiddenReason(x) : ''].filter(Boolean).join('\n'), buttons);
     }
     var regionAge = regionsAt ? Math.max(0, Math.round((Date.now() - regionsAt) / 3600000)) + 'h ago' : 'never';
 
@@ -834,7 +856,7 @@
     var vpnTop = ccLocked.top.slice(0, 3);
     function vpnHelp() {
       var lines = ccLocked.top.slice(0, 8).map(function (code) { return flag(code, true) + ': unlocks ' + ccLocked.counts[code] + ' quest' + (ccLocked.counts[code] === 1 ? '' : 's'); });
-      RN.Alert.alert('Quests your region does not get', (lines.length ? lines.join('\n') + '\n\n' : '') +
+      popup('Quests your region does not get', (lines.length ? lines.join('\n') + '\n\n' : '') +
         '1. Turn on a VPN app set to the country with the most quests (a split-tunnel for Discord is enough).\n2. Come back here and tap “Retry refused quests”.\n3. Tap “Accept all live hidden”.\n\nThe VPN can be turned off again after accepting.');
     }
     var next;
@@ -845,7 +867,7 @@
     var q = qS[0];
     var active = all.filter(function (x) { return x.status === 'enrolled'; }).sort(function (a, b) { return (Number.isFinite(a.expMs) ? a.expMs : Infinity) - (Number.isFinite(b.expMs) ? b.expMs : Infinity); });
     function howTo() {
-      RN.Alert.alert('How to use Quest Inspector', '1. Open Discord\u2019s Quests screen once so the quests load.\n2. The top row tells you the next step. Tap \u201cAccept all live hidden\u201d to accept every hidden quest that is live.\n3. If Discord refuses quests for your region, turn on a VPN in the country shown under \u201cVPN apps\u201d. The plugin notices the new country and checks again.\n4. Accepted quests show their progress at the top, and you get a reminder before they expire.');
+      popup('How to use Quest Inspector', '1. Open Discord\u2019s Quests screen once so the quests load.\n2. The top row tells you the next step. Tap \u201cAccept all live hidden\u201d to accept every hidden quest that is live.\n3. If Discord refuses quests for your region, turn on a VPN in the country shown under \u201cVPN apps\u201d. The plugin notices the new country and checks again.\n4. Accepted quests show their progress at the top, and you get a reminder before they expire.');
     }
 
     return h(RN.ScrollView, { style: { flex: 1 }, contentContainerStyle: { paddingBottom: 24 } },
@@ -1064,6 +1086,36 @@
         check();
       });
       cleanup(function () { if (timer) clearInterval(timer); });
+
+      // a row of its own in Valenced's settings list (next to Plugins, Themes, Developer ...)
+      try {
+        var S = V.discord.modules.settings, ROW = 'moon.quest-inspector.row', offs = [];
+        cleanup(function () { offs.forEach(function (f) { try { f(); } catch (e) {} }); });
+        var QuestScreen = function (sp) {
+          React.useLayoutEffect(function () { try { sp.navigation.setOptions({ title: 'Quest Inspector' }); } catch (e) {} }, []);
+          return h(Inspector, { api: { jsonStorage: ctx.jsonStorage } });
+        };
+        var useTrailing = function () {
+          var t = React.useState(0);
+          React.useEffect(function () { var i = setInterval(function () { t[1](function (n) { return n + 1; }); }, 6000); return function () { clearInterval(i); }; }, []);
+          try {
+            var all = unify(collect()), n = all.filter(function (x) { return x.hidden && (LIVE_STATUSES.indexOf(x.status) >= 0 || x.status === 'enrolled'); }).length;
+            return n ? n + ' hidden' : (all.length ? all.length + ' quests' : '');
+          } catch (e) { return ''; }
+        };
+        var register = function () {
+          offs.push(S.registerSettingsItem(ROW, {
+            parent: null, type: 'route',
+            IconComponent: function () { return h(V.components.TableRowAssetIcon, { name: 'QuestsIcon' }); },
+            useTitle: function () { return 'Quest Inspector'; },
+            useTrailing: useTrailing,
+            screen: { route: ROW, getComponent: function () { return QuestScreen; } }
+          }));
+          offs.push(S.addSettingsItemToSection('VALENCED', ROW, -1));
+          if (typeof S.refreshSettings === 'function') S.refreshSettings();
+        };
+        cleanup(S.onSettingsModulesLoaded(register));
+      } catch (e) { ctx.plugin.reportError(e); }
     },
     SettingsComponent: Inspector
   });
