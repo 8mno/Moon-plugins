@@ -349,16 +349,48 @@
     var s = list.slice(0, max).map(function (c) { return flag(c, withCode); }).join(withCode ? ', ' : ' ');
     return list.length > max ? s + ' +' + (list.length - max) : s;
   }
+  // Which country Discord thinks you are in is not exposed anywhere, but it can be worked out: every
+  // regional quest Discord really shows you (not hidden, still available) must allow your country.
+  // Intersect their include lists and drop their exclude lists; what is left is your country.
+  var userRegion = { codes: [], n: 0 };
+  function inferRegion(list) {
+    var cand = null, banned = {}, n = 0;
+    list.forEach(function (x) {
+      if (x.hidden || x.status !== 'available') return;
+      var r = regionFor(x.id);
+      if (!r || r.g) return;
+      if (r.i.length) {
+        var inc = {}; r.i.forEach(function (c) { inc[c] = 1; });
+        cand = cand ? cand.filter(function (c) { return inc[c]; }) : r.i.slice();
+        n++;
+      }
+      r.e.forEach(function (c) { banned[c] = 1; });
+      if (r.e.length) n++;
+    });
+    if (cand) cand = cand.filter(function (c) { return !banned[c]; });
+    // an empty answer means the lists disagree (old list, or a VPN switched mid-way): say "unknown"
+    return cand && cand.length && cand.length <= 12 ? { codes: cand, n: n } : { codes: [], n: 0 };
+  }
+  // 'yes' | 'no' | 'maybe' | 'unknown': would Discord show this quest to the country you are in now?
+  function access(id) {
+    var r = regionFor(id), me = userRegion.codes;
+    if (!r || !me.length) return 'unknown';
+    if (r.g) return 'yes';
+    var ok = me.filter(function (c) { return (!r.i.length || r.i.indexOf(c) >= 0) && r.e.indexOf(c) < 0; }).length;
+    if (!r.i.length && !r.e.length) return 'unknown';
+    return ok === me.length ? 'yes' : ok === 0 ? 'no' : 'maybe';
+  }
   function regionLabel(id, long) {
     var r = regionFor(id);
-    if (!r) return regionsAt ? '\u2754 region unknown' : '';
+    if (!r) return regionsAt ? '\u2754 not in the region list yet' : '';
     var age = r.a ? ' \uD83D\uDD1E' : '';
     if (r.g) return '\uD83C\uDF10 global' + age;
     var parts = [];
     if (r.i.length) parts.push('only ' + flags(r.i, long ? 99 : 6, long));
     if (r.e.length) parts.push('not ' + flags(r.e, long ? 99 : 6, long));
     if (!parts.length) parts.push('\uD83D\uDD12 region-limited');
-    return parts.join(' \u00b7 ') + age;
+    var a = access(id);
+    return parts.join(' \u00b7 ') + (a === 'yes' ? ' \u00b7 \u2705 your region' : a === 'no' ? ' \u00b7 \uD83D\uDEAB not your region' : '') + age;
   }
   function regionHay(id) {
     var r = regionFor(id);
@@ -366,7 +398,7 @@
   }
   function hiddenReason(x) {
     var why = [];
-    if (regionKind(x.id) === 'regional') why.push('region-limited');
+    if (regionKind(x.id) === 'regional') why.push(access(x.id) === 'no' ? 'not offered in ' + flags(userRegion.codes, 3) : 'region-limited');
     if (x.types.length && x.types.every(function (t) { return DESKTOP_ONLY.indexOf(t) >= 0; })) why.push('needs desktop/console');
     return why.length ? 'likely ' + why.join(' + ') : 'reason unknown';
   }
@@ -379,7 +411,7 @@
       var r = regionFor(x.id);
       if (!r) { unknown++; return; }
       if (r.g) { globalN++; return; }
-      if (r.i.length) r.i.forEach(function (c) { counts[c] = (counts[c] || 0) + 1; });
+      if (r.i.length) r.i.forEach(function (c) { if (userRegion.codes.indexOf(c) < 0) counts[c] = (counts[c] || 0) + 1; });
       else open++;
     });
     var top = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a] || (a < b ? -1 : 1); });
@@ -460,12 +492,14 @@
     }
     add(d.store, 'store'); add(d.hookQuests, 'shown'); add(d.hookExcluded, 'excluded');
     add(d.storeClaimed, 'claimed'); add(d.hookClaimed, 'claimed');
-    return Array.from(map.values()).map(function (e) {
+    var infos = Array.from(map.values()).map(function (e) {
       var info = describe(e.q);
       info.q = e.q;
       info.hidden = !!e.flags.excluded && !e.flags.shown;
       return info;
     });
+    userRegion = inferRegion(infos);
+    return infos;
   }
 
   function applyView(list, c, query) {
@@ -661,7 +695,7 @@
     var regionAge = regionsAt ? Math.max(0, Math.round((Date.now() - regionsAt) / 3600000)) + 'h ago' : 'never';
 
     // what the user should do next, in one sentence
-    var lockedList = all.filter(function (x) { return x.status === 'locked'; });
+    var lockedList = all.filter(function (x) { return x.status === 'locked' || (x.hidden && LIVE_STATUSES.indexOf(x.status) >= 0 && access(x.id) === 'no'); });
     var ccLocked = countryCounts(lockedList);
     var vpnTop = ccLocked.top.slice(0, 3);
     function vpnHelp() {
@@ -703,6 +737,10 @@
         // inputs go straight in the Page (like Valenced's own plugins), not inside a TableRowGroup
         h(TI, { value: q, placeholder: 'Search name, reward, game, type, country code', size: 'md', onChange: onText, onChangeText: onText }),
         h(Design.TableRowGroup, { title: 'Quests (' + view.length + ' of ' + all.length + ')' },
+          h(Design.TableRow, {
+            label: userRegion.codes.length ? 'Your region: ' + flags(userRegion.codes, 4) + ' (' + userRegion.codes.join(', ') + ')' : 'Your region: not known yet',
+            subLabel: userRegion.codes.length ? 'Worked out from the ' + userRegion.n + ' region-limited quests Discord shows you now. It follows your VPN after a refresh.' : 'Needs at least one region-limited quest that Discord already shows you.'
+          }),
           h(Design.TableRow, { label: 'Show: ' + c.filter, subLabel: 'Tap to change: ' + FILTERS.join(' / '), onPress: function () { set({ filter: cycle(FILTERS, c.filter) }); } }),
           h(Design.TableRow, { label: 'Region: ' + c.region, subLabel: 'Tap to change: ' + REGION_FILTERS.join(' / ') + '. You can also search a country code like US or IQ.', onPress: function () { set({ region: cycle(REGION_FILTERS, c.region) }); } }),
           cc.top.length > 0 && h(Design.TableRow, {
