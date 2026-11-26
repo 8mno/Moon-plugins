@@ -31,6 +31,10 @@
     gone: {},            // quest id -> when Discord said it has expired
     locked: {},          // quest id -> when Discord said it is unknown (not offered to this account/region)
     acceptDelay: 1500,   // ms between "Accept all" requests
+    relayOn: true,       // send accepts for region-locked quests through your own relay (see Valenced/relay)
+    relays: '',          // "DE=https://de.example.com US=https://us.example.com https://any.example.com"
+    relayKey: '',        // shared secret the relay was started with
+    done: {},            // quest id -> when a relay accept was confirmed
     seeded: false,
     seen: []
   };
@@ -426,6 +430,7 @@
     if (out.status === 'available' || out.status === 'unverified' || out.status === 'old') {
       if (isGone(out.id)) out.status = 'gone';
       else if (isLocked(out.id)) out.status = 'locked';
+      if (own(doneMap, out.id) && !isGone(out.id)) out.status = 'enrolled';
     }
     return out;
   }
@@ -526,18 +531,126 @@
     var code = typeof body.code === 'number' ? ' (code ' + body.code + ')' : '';
     return st + m + code;
   }
+  // ---------- relay: repeat the accept from a server in the quest's country ----------
+  var authStore = null;        // Discord's AuthenticationStore, resolved in start()
+  var doneMap = {};            // quest id -> when a relay accept was confirmed
+  var relayStatus = '';
+  function getToken() {
+    try { if (authStore && typeof authStore.getToken === 'function') return authStore.getToken(); } catch (e) {}
+    try {
+      var r = finders.lookupModule(finders.filters.withProps('getToken', 'getFingerprint'));
+      if (r && r[0] && typeof r[0].getToken === 'function') return r[0].getToken();
+    } catch (e2) {}
+    return null;
+  }
+  // "DE=https://de.example.com US=https://us.example.com https://any.example.com" -> { map, any, count, bad }
+  function parseRelays(str) {
+    var out = { map: {}, any: '', count: 0, bad: [] };
+    String(str || '').split(/[\s,;]+/).filter(Boolean).forEach(function (t) {
+      var m = /^(?:([A-Za-z]{2})=)?(https:\/\/[^\s\/?#@]+(?:\/[^\s?#]*)?)$/.exec(t);
+      if (!m) { out.bad.push(t.slice(0, 40)); return; }
+      var url = m[2].replace(/\/+$/, '');
+      if (m[1]) { var cc = m[1].toUpperCase(); if (cc === 'UK') cc = 'GB'; if (!out.map[cc]) out.count++; out.map[cc] = url; }
+      else if (!out.any) { out.any = url; out.count++; }
+    });
+    return out;
+  }
+  // Which relays can show this quest to Discord, best first: the countries it is limited to, otherwise
+  // any relay whose country is not on its exclude list.
+  function relayCandidates(id, rl) {
+    var r = regionFor(id), list = [], seen = {};
+    function add(cc, url) { if (url && !seen[url]) { seen[url] = 1; list.push({ cc: cc, url: url }); } }
+    if (r && !r.g && r.i.length) { r.i.forEach(function (cc) { add(cc, rl.map[cc]); }); }
+    else {
+      Object.keys(rl.map).forEach(function (cc) { if (!(r && r.e.indexOf(cc) >= 0)) add(cc, rl.map[cc]); });
+      add('*', rl.any);
+    }
+    return list;
+  }
+  async function callRelay(url, route, payload, key) {
+    var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    var t = ctrl ? setTimeout(function () { ctrl.abort(); }, 20000) : null;
+    var res;
+    try {
+      res = await fetch(url + route, { method: 'POST', headers: { 'content-type': 'application/json', 'x-relay-key': key }, body: JSON.stringify(payload), signal: ctrl ? ctrl.signal : undefined });
+    } catch (e) { throw new Error('relay unreachable: ' + (e && e.message ? e.message : e)); }
+    finally { if (t) clearTimeout(t); }
+    var j = null; try { j = await res.json(); } catch (e3) {}
+    if (res.status === 401) throw new Error('relay says the key is wrong');
+    if (!res.ok || !isObj(j)) throw new Error('relay error HTTP ' + res.status + (isObj(j) && j.error ? ' (' + j.error + ')' : ''));
+    return j;
+  }
+  // POST /quests/{id}/enroll through one relay; resolves with Discord's answer {status, body}
+  async function relayEnroll(cand, id, key) {
+    var token = getToken();
+    if (typeof token !== 'string' || !token) throw new Error('Could not read your Discord token to send to the relay.');
+    return callRelay(cand.url, '/v1/enroll', { id: id, token: token, location: QUEST_HOME_MOBILE }, key);
+  }
+  async function testRelays(rl, key, setMsg) {
+    var lines = [];
+    var all = Object.keys(rl.map).map(function (cc) { return { cc: cc, url: rl.map[cc] }; });
+    if (rl.any) all.push({ cc: '*', url: rl.any });
+    for (var i = 0; i < all.length; i++) {
+      try {
+        var j = await callRelay(all[i].url, '/v1/health', {}, key);
+        var real = j.country || '?';
+        var tag = all[i].cc === '*' ? '' : (real === all[i].cc ? ' ✅' : (real === '?' ? '' : ' ⚠ you set ' + all[i].cc));
+        lines.push(flag(real) + ' ' + real + tag);
+      } catch (e) { lines.push((all[i].cc === '*' ? 'default' : all[i].cc) + ': ' + (e && e.message ? e.message : e)); }
+    }
+    relayStatus = lines.join(' · ');
+    setMsg('Relay test: ' + (lines.join('; ') || 'no relays set'));
+  }
+
   // The accept request Discord's own button sends: POST /quests/{id}/enroll with a "location".
   // The server's reply carries enrolled_at, and that is the only thing counted as success.
-  async function enrollOne(x) {
+  function confirmed(res) {
+    if (isObj(res) && (res.ok === false || (typeof res.status === 'number' && res.status >= 400))) throw res;
+    var body = isObj(res) && isObj(res.body) ? res.body : res;
+    if (!isObj(body) || !(body.enrolled_at || body.enrolledAt)) throw new Error('Server reply had no enrolled_at, so this was not confirmed.');
+  }
+  async function enrollDirect(x) {
     var http = httpModule();
-    if (!http) throw new Error('Discord\u2019s HTTP client was not found. Open the Quests screen once and retry.');
+    if (!http) throw new Error('Discord’s HTTP client was not found. Open the Quests screen once and retry.');
     var res;
     viaPlugin++;
     try { res = await http.post({ url: '/quests/' + encodeURIComponent(x.id) + '/enroll', body: { location: QUEST_HOME_MOBILE }, retries: 0 }); }
     finally { viaPlugin--; }
-    if (isObj(res) && (res.ok === false || (typeof res.status === 'number' && res.status >= 400))) throw res;
-    var body = isObj(res) && isObj(res.body) ? res.body : res;
-    if (!isObj(body) || !(body.enrolled_at || body.enrolledAt)) throw new Error('Server reply had no enrolled_at, so this was not confirmed.');
+    confirmed(res);
+  }
+  function markDone(id) {
+    doneMap[id] = Date.now();
+    var one = {}; one[id] = doneMap[id];
+    try { if (storageRef) storageRef.set({ done: one }).catch(function () {}); } catch (e) {}
+  }
+  async function enrollOne(x) {
+    var c = cfgNow(), rl = parseRelays(c.relays), key = String(c.relayKey || '');
+    var cands = c.relayOn && key && rl.count ? relayCandidates(x.id, rl) : [];
+    var limited = regionKind(x.id) === 'regional' || isLocked(x.id);
+    var directErr = null;
+    // a quest known to be region-limited goes straight to a relay in its country; others try this phone first
+    if (!limited || !cands.length) {
+      try { await enrollDirect(x); return; }
+      catch (e) { directErr = e; if (!cands.length || (refusalKind(e) !== 'locked' && !limited)) throw e; }
+    }
+    var lastErr = directErr;
+    for (var i = 0; i < cands.length; i++) {
+      var tag = cands[i].cc === '*' ? 'relay' : 'relay ' + cands[i].cc;
+      try {
+        var r = await relayEnroll(cands[i], x.id, key);
+        recordEnroll(x.id, isObj(r) && r.status < 400, tag + ' HTTP ' + (isObj(r) ? r.status : '?') + ' ' + bodyPreview(isObj(r) ? r.body : ''), 'plugin', '');
+        confirmed(r);
+        markDone(x.id);
+        delete lockedMap[x.id];
+        return;
+      } catch (e2) {
+        lastErr = e2;
+        if (!isObj(e2) || typeof e2.status !== 'number') recordEnroll(x.id, false, tag + ': ' + (e2 && e2.message ? e2.message : e2), 'plugin', '');
+        if (isObj(e2) && refusalKind(e2) === 'gone') { markRefused(x.id, e2); throw e2; }
+      }
+    }
+    if (isObj(lastErr)) markRefused(x.id, lastErr);
+    throw lastErr || new Error('No relay is set up for this quest’s region.');
   }
   async function acceptList(list, setMsg) {
     var ok = 0, fail = [], delay = cfgNow().acceptDelay;
@@ -638,6 +751,10 @@
     var goneN = all.filter(function (x) { return x.status === 'gone'; }).length;
     var stubCount = all.filter(function (x) { return !x.known; }).length;
     var TI = V.components.SearchInput || Design.TextInput || RN.TextInput;
+    var rl = parseRelays(c.relays);
+    function textOf(x) { return typeof x === 'string' ? x : ((x && x.nativeEvent && x.nativeEvent.text) || ''); }
+    function onRelays(x) { set({ relays: textOf(x) }); }
+    function onKey(x) { set({ relayKey: textOf(x).trim() }); }
     function onText(x) { qS[1](typeof x === 'string' ? x : ((x && x.nativeEvent && x.nativeEvent.text) || '')); }
 
     function confirmAccept(list, title) {
@@ -718,6 +835,20 @@
 
         // inputs go straight in the Page (like Valenced's own plugins), not inside a TableRowGroup
         h(TI, { value: qS[0], placeholder: 'Search name, reward, game, type, country code', size: 'md', onChange: onText, onChangeText: onText }),
+        h(Design.TableRowGroup, { title: 'Relay (your own server in the quest\u2019s country)' },
+          h(Design.TableRow, {
+            label: rl.count ? 'Relays: ' + Object.keys(rl.map).map(function (k) { return flag(k); }).join(' ') + (rl.any ? ' + default' : '') + (c.relayOn ? '' : ' (off)') : 'Relays: none set',
+            subLabel: (relayStatus ? relayStatus + '. ' : '') + (rl.bad.length ? 'Ignored (must be https://): ' + rl.bad.join(', ') + '. ' : '') + 'Token ' + (getToken() ? 'found' : 'NOT found') + '. Set up the relay server from Valenced/relay in the repo.'
+          }),
+          h(Design.TableSwitchRow, { label: 'Use relay for region-locked quests', value: !!c.relayOn, onValueChange: function (v) { set({ relayOn: v }); } }),
+          h(TI, { value: c.relays, placeholder: 'DE=https://de.example.com US=https://us.example.com', size: 'md', onChange: onRelays, onChangeText: onRelays }),
+          h(TI, { value: c.relayKey, placeholder: 'Relay key (the RELAY_KEY you started it with)', size: 'md', onChange: onKey, onChangeText: onKey }),
+          h(Design.TableRow, {
+            label: 'Test relays',
+            subLabel: 'Asks each relay which country it really is in and warns if that differs from the code you set.',
+            onPress: function () { testRelays(rl, String(c.relayKey || ''), setMsg); }
+          })),
+
         h(Design.TableRowGroup, { title: 'Find' },
           h(Design.TableRow, {
             label: cc.top.length ? 'Unlock by country: ' + cc.top.slice(0, 4).map(function (code) { return flag(code) + ' ' + cc.counts[code]; }).join('  ') : 'Unlock by country: no region data yet',
@@ -791,6 +922,7 @@
         } catch (e) { ctx.plugin.reportError(e); }
       }
       patchHttp();
+      try { V.discord.flux.getStore('AuthenticationStore', function (st) { authStore = st; }); } catch (e) { /* falls back to a module lookup */ }
 
       // new-quest alerts
       var seenMemo = null;
@@ -824,6 +956,7 @@
         if (isObj(cs.meta) && Object.keys(cs.meta).length) setMeta(cs.meta, Number(cs.metaAt) || 0);
         if (isObj(cs.gone)) Object.keys(cs.gone).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.gone[k] === 'number') goneMap[k] = cs.gone[k]; });
         if (isObj(cs.locked)) Object.keys(cs.locked).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.locked[k] === 'number') lockedMap[k] = cs.locked[k]; });
+        if (isObj(cs.done)) Object.keys(cs.done).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.done[k] === 'number') doneMap[k] = cs.done[k]; });
         loadRegions(false);
         timer = setInterval(function () { patchHttp(); if (RN.AppState.currentState === 'active') { maybeMeta(); maybeProbe(); } check(); }, 8000);
         check();
