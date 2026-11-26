@@ -404,6 +404,7 @@
     out.known = isObj(cfg.messages);
     // a stub with no details has no expiry, so guess from the age of its id: quests last weeks, not months
     if (!out.known && out.status === 'available') out.status = isGone(out.id) ? 'gone' : (out.id && idAgeDays(out.id) <= 30 ? 'unverified' : 'old');
+    if (isGone(out.id) && (out.status === 'available' || out.status === 'unverified' || out.status === 'old')) out.status = 'gone';
     return out;
   }
 
@@ -471,6 +472,24 @@
     return out;
   }
 
+  // ---------- record what the server says to every accept (ours and Discord's own button) ----------
+  var enrollLog = [];       // newest last, capped
+  var viaPlugin = 0;        // > 0 while the plugin itself is sending an accept
+  function recordEnroll(id, ok, text, src, sent) {
+    enrollLog.push({ id: id, ok: ok, text: String(text).slice(0, 300), src: src, sent: sent || '', at: Date.now() });
+    if (enrollLog.length > 12) enrollLog.shift();
+  }
+  // "unknown / ended" answers mean the quest is not there for us any more: take it off the live list
+  function markGone(id, e) {
+    if (!isObj(e)) return;
+    var t = errText(e);
+    if (e.status !== 404 && !/unknown quest|has ended|ended|expired|not active|no longer/i.test(t)) return;
+    goneMap[id] = Date.now();
+    var one = {}; one[id] = goneMap[id];
+    try { if (storageRef) storageRef.set({ gone: one }).catch(function () {}); } catch (e2) {}
+  }
+  function bodyPreview(b) { try { return JSON.stringify(b).slice(0, 200); } catch (e) { return ''; } }
+
   // ---------- accepting ----------
   function httpModule() {
     var r = finders.lookupModule(finders.filters.withProps('HTTP'));
@@ -490,7 +509,10 @@
   async function enrollOne(x) {
     var http = httpModule();
     if (!http) throw new Error('Discord\u2019s HTTP client was not found. Open the Quests screen once and retry.');
-    var res = await http.post({ url: '/quests/' + encodeURIComponent(x.id) + '/enroll', body: { location: QUEST_HOME_MOBILE }, retries: 0 });
+    var res;
+    viaPlugin++;
+    try { res = await http.post({ url: '/quests/' + encodeURIComponent(x.id) + '/enroll', body: { location: QUEST_HOME_MOBILE }, retries: 0 }); }
+    finally { viaPlugin--; }
     if (isObj(res) && (res.ok === false || (typeof res.status === 'number' && res.status >= 400))) throw res;
     var body = isObj(res) && isObj(res.body) ? res.body : res;
     if (!isObj(body) || !(body.enrolled_at || body.enrolledAt)) throw new Error('Server reply had no enrolled_at, so this was not confirmed.');
@@ -616,6 +638,16 @@
           h(Design.TableRow, { label: d.storeFound ? 'Quest store found' : 'Quest store NOT found', subLabel: 'Open Discord\u2019s Quests screen once so everything loads.' }),
           h(Design.TableRow, { label: all.length + ' quests: ' + live.length + ' available, ' + hiddenCount + ' hidden by client (' + liveHidden.length + ' hidden and available)' }),
           h(Design.TableRow, { label: 'Names: ' + (all.length - stubCount) + ' of ' + all.length + ' quests have details' + (stubCount ? ' (' + stubCount + ' only an id)' : ''), subLabel: 'Hidden quests arrive from Discord as bare ids. Details come from a community tracker (' + metaStatus + '). Quests newer than the tracker stay as ids. Tap to download.', onPress: function () { setMsg('Downloading quest details...'); loadMeta(true).then(function (okM) { setMsg(okM ? 'Quest details updated.' : 'Quest details: ' + metaStatus); }); } }),
+          h(Design.TableRow, (function () {
+            var e = enrollLog[enrollLog.length - 1];
+            if (!e) return { label: 'Last accept: none yet', subLabel: 'Every accept, including Discord\u2019s own button, is recorded here with the server\u2019s answer.' };
+            var q = all.filter(function (x) { return x.id === e.id; })[0];
+            return {
+              label: 'Last accept: ' + (e.ok ? 'worked' : 'refused') + ' \u00b7 ' + (q && q.known ? q.name : e.id) + ' \u00b7 ' + e.src,
+              subLabel: e.text + (e.sent ? ' (sent ' + e.sent + ')' : '') + '. Tap to copy the last ' + enrollLog.length + '.',
+              onPress: function () { copyText(JSON.stringify(enrollLog.map(function (z) { return { id: z.id, ok: z.ok, by: z.src, reply: z.text, sent: z.sent, secondsAgo: Math.round((Date.now() - z.at) / 1000) }; }), null, 2), setMsg); }
+            };
+          })()),
           h(Design.TableRow, { label: 'Live check: ' + probeStatus, subLabel: 'Asks Discord if each hidden quest is still active (newest 25 at a time). Tap to run now.', onPress: function () { setMsg('Checking with Discord...'); loadProbe().then(function () { setMsg('Live check: ' + probeStatus); }); } }),
           !!skippedHidden && h(Design.TableRow, { label: skippedHidden + ' hidden quest(s) not added to Discord\u2019s list', subLabel: 'No details for them yet, so Discord\u2019s quest card could not draw them.' }),
           h(Design.TableRow, { label: hasHttp ? 'Accept: Discord HTTP client found' : 'Accept: Discord HTTP client NOT found', subLabel: 'Open the Quests screen once if it is missing.' }),
@@ -701,6 +733,32 @@
         { max: Infinity }
       ));
 
+      // Watch accept requests (read-only: the original call always runs unchanged and its result is returned as is)
+      var httpPatched = false;
+      function patchHttp() {
+        if (httpPatched) return;
+        try {
+          var http = httpModule();
+          if (!http) return;
+          httpPatched = true;
+          cleanup(V.patcher.instead(http, 'post', function (args, orig) {
+            var p = Reflect.apply(orig, this, args);
+            try {
+              var o = args[0];
+              var m = isObj(o) && typeof o.url === 'string' ? /\/quests\/(\d{5,25})\/enroll\b/.exec(o.url) : null;
+              if (m) {
+                var id = m[1], src = viaPlugin > 0 ? 'plugin' : 'Discord', sent = bodyPreview(o.body);
+                Promise.resolve(p).then(function (r) {
+                  recordEnroll(id, true, 'HTTP ' + (isObj(r) && r.status ? r.status : 'ok') + ' ' + bodyPreview(isObj(r) ? r.body : ''), src, sent);
+                }, function (e) { recordEnroll(id, false, errText(e), src, sent); markGone(id, e); });
+              }
+            } catch (e) { /* never let logging break a request */ }
+            return p;
+          }));
+        } catch (e) { ctx.plugin.reportError(e); }
+      }
+      patchHttp();
+
       // new-quest alerts
       var seenMemo = null;
       function check() {
@@ -733,7 +791,7 @@
         if (isObj(cs.meta) && Object.keys(cs.meta).length) setMeta(cs.meta, Number(cs.metaAt) || 0);
         if (isObj(cs.gone)) Object.keys(cs.gone).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.gone[k] === 'number') goneMap[k] = cs.gone[k]; });
         loadRegions(false);
-        timer = setInterval(function () { if (RN.AppState.currentState === 'active') { maybeMeta(); maybeProbe(); } check(); }, 8000);
+        timer = setInterval(function () { patchHttp(); if (RN.AppState.currentState === 'active') { maybeMeta(); maybeProbe(); } check(); }, 8000);
         check();
       });
       cleanup(function () { if (timer) clearInterval(timer); });
