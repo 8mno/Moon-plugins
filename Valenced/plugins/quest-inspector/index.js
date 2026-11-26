@@ -31,10 +31,6 @@
     gone: {},            // quest id -> when Discord said it has expired
     locked: {},          // quest id -> when Discord said it is unknown (not offered to this account/region)
     acceptDelay: 1500,   // ms between "Accept all" requests
-    relayOn: true,       // send accepts for region-locked quests through your own relay (see Valenced/relay)
-    relays: '',          // "DE=https://de.example.com US=https://us.example.com https://any.example.com"
-    relayKey: '',        // shared secret the relay was started with
-    done: {},            // quest id -> when a relay accept was confirmed
     seeded: false,
     seen: []
   };
@@ -430,7 +426,6 @@
     if (out.status === 'available' || out.status === 'unverified' || out.status === 'old') {
       if (isGone(out.id)) out.status = 'gone';
       else if (isLocked(out.id)) out.status = 'locked';
-      if (own(doneMap, out.id) && !isGone(out.id)) out.status = 'enrolled';
     }
     return out;
   }
@@ -531,126 +526,18 @@
     var code = typeof body.code === 'number' ? ' (code ' + body.code + ')' : '';
     return st + m + code;
   }
-  // ---------- relay: repeat the accept from a server in the quest's country ----------
-  var authStore = null;        // Discord's AuthenticationStore, resolved in start()
-  var doneMap = {};            // quest id -> when a relay accept was confirmed
-  var relayStatus = '';
-  function getToken() {
-    try { if (authStore && typeof authStore.getToken === 'function') return authStore.getToken(); } catch (e) {}
-    try {
-      var r = finders.lookupModule(finders.filters.withProps('getToken', 'getFingerprint'));
-      if (r && r[0] && typeof r[0].getToken === 'function') return r[0].getToken();
-    } catch (e2) {}
-    return null;
-  }
-  // "DE=https://de.example.com US=https://us.example.com https://any.example.com" -> { map, any, count, bad }
-  function parseRelays(str) {
-    var out = { map: {}, any: '', count: 0, bad: [] };
-    String(str || '').split(/[\s,;]+/).filter(Boolean).forEach(function (t) {
-      var m = /^(?:([A-Za-z]{2})=)?(https:\/\/[^\s\/?#@]+(?:\/[^\s?#]*)?)$/.exec(t);
-      if (!m) { out.bad.push(t.slice(0, 40)); return; }
-      var url = m[2].replace(/\/+$/, '');
-      if (m[1]) { var cc = m[1].toUpperCase(); if (cc === 'UK') cc = 'GB'; if (!out.map[cc]) out.count++; out.map[cc] = url; }
-      else if (!out.any) { out.any = url; out.count++; }
-    });
-    return out;
-  }
-  // Which relays can show this quest to Discord, best first: the countries it is limited to, otherwise
-  // any relay whose country is not on its exclude list.
-  function relayCandidates(id, rl) {
-    var r = regionFor(id), list = [], seen = {};
-    function add(cc, url) { if (url && !seen[url]) { seen[url] = 1; list.push({ cc: cc, url: url }); } }
-    if (r && !r.g && r.i.length) { r.i.forEach(function (cc) { add(cc, rl.map[cc]); }); }
-    else {
-      Object.keys(rl.map).forEach(function (cc) { if (!(r && r.e.indexOf(cc) >= 0)) add(cc, rl.map[cc]); });
-      add('*', rl.any);
-    }
-    return list;
-  }
-  async function callRelay(url, route, payload, key) {
-    var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
-    var t = ctrl ? setTimeout(function () { ctrl.abort(); }, 20000) : null;
-    var res;
-    try {
-      res = await fetch(url + route, { method: 'POST', headers: { 'content-type': 'application/json', 'x-relay-key': key }, body: JSON.stringify(payload), signal: ctrl ? ctrl.signal : undefined });
-    } catch (e) { throw new Error('relay unreachable: ' + (e && e.message ? e.message : e)); }
-    finally { if (t) clearTimeout(t); }
-    var j = null; try { j = await res.json(); } catch (e3) {}
-    if (res.status === 401) throw new Error('relay says the key is wrong');
-    if (!res.ok || !isObj(j)) throw new Error('relay error HTTP ' + res.status + (isObj(j) && j.error ? ' (' + j.error + ')' : ''));
-    return j;
-  }
-  // POST /quests/{id}/enroll through one relay; resolves with Discord's answer {status, body}
-  async function relayEnroll(cand, id, key) {
-    var token = getToken();
-    if (typeof token !== 'string' || !token) throw new Error('Could not read your Discord token to send to the relay.');
-    return callRelay(cand.url, '/v1/enroll', { id: id, token: token, location: QUEST_HOME_MOBILE }, key);
-  }
-  async function testRelays(rl, key, setMsg) {
-    var lines = [];
-    var all = Object.keys(rl.map).map(function (cc) { return { cc: cc, url: rl.map[cc] }; });
-    if (rl.any) all.push({ cc: '*', url: rl.any });
-    for (var i = 0; i < all.length; i++) {
-      try {
-        var j = await callRelay(all[i].url, '/v1/health', {}, key);
-        var real = j.country || '?';
-        var tag = all[i].cc === '*' ? '' : (real === all[i].cc ? ' ✅' : (real === '?' ? '' : ' ⚠ you set ' + all[i].cc));
-        lines.push(flag(real) + ' ' + real + tag);
-      } catch (e) { lines.push((all[i].cc === '*' ? 'default' : all[i].cc) + ': ' + (e && e.message ? e.message : e)); }
-    }
-    relayStatus = lines.join(' · ');
-    setMsg('Relay test: ' + (lines.join('; ') || 'no relays set'));
-  }
-
   // The accept request Discord's own button sends: POST /quests/{id}/enroll with a "location".
   // The server's reply carries enrolled_at, and that is the only thing counted as success.
-  function confirmed(res) {
-    if (isObj(res) && (res.ok === false || (typeof res.status === 'number' && res.status >= 400))) throw res;
-    var body = isObj(res) && isObj(res.body) ? res.body : res;
-    if (!isObj(body) || !(body.enrolled_at || body.enrolledAt)) throw new Error('Server reply had no enrolled_at, so this was not confirmed.');
-  }
-  async function enrollDirect(x) {
+  async function enrollOne(x) {
     var http = httpModule();
-    if (!http) throw new Error('Discord’s HTTP client was not found. Open the Quests screen once and retry.');
+    if (!http) throw new Error('Discord\u2019s HTTP client was not found. Open the Quests screen once and retry.');
     var res;
     viaPlugin++;
     try { res = await http.post({ url: '/quests/' + encodeURIComponent(x.id) + '/enroll', body: { location: QUEST_HOME_MOBILE }, retries: 0 }); }
     finally { viaPlugin--; }
-    confirmed(res);
-  }
-  function markDone(id) {
-    doneMap[id] = Date.now();
-    var one = {}; one[id] = doneMap[id];
-    try { if (storageRef) storageRef.set({ done: one }).catch(function () {}); } catch (e) {}
-  }
-  async function enrollOne(x) {
-    var c = cfgNow(), rl = parseRelays(c.relays), key = String(c.relayKey || '');
-    var cands = c.relayOn && key && rl.count ? relayCandidates(x.id, rl) : [];
-    var limited = regionKind(x.id) === 'regional' || isLocked(x.id);
-    var directErr = null;
-    // a quest known to be region-limited goes straight to a relay in its country; others try this phone first
-    if (!limited || !cands.length) {
-      try { await enrollDirect(x); return; }
-      catch (e) { directErr = e; if (!cands.length || (refusalKind(e) !== 'locked' && !limited)) throw e; }
-    }
-    var lastErr = directErr;
-    for (var i = 0; i < cands.length; i++) {
-      var tag = cands[i].cc === '*' ? 'relay' : 'relay ' + cands[i].cc;
-      try {
-        var r = await relayEnroll(cands[i], x.id, key);
-        recordEnroll(x.id, isObj(r) && r.status < 400, tag + ' HTTP ' + (isObj(r) ? r.status : '?') + ' ' + bodyPreview(isObj(r) ? r.body : ''), 'plugin', '');
-        confirmed(r);
-        markDone(x.id);
-        delete lockedMap[x.id];
-        return;
-      } catch (e2) {
-        lastErr = e2;
-        if (!isObj(e2) || typeof e2.status !== 'number') recordEnroll(x.id, false, tag + ': ' + (e2 && e2.message ? e2.message : e2), 'plugin', '');
-        if (isObj(e2) && refusalKind(e2) === 'gone') { markRefused(x.id, e2); throw e2; }
-      }
-    }
-    if (isObj(lastErr)) markRefused(x.id, lastErr);
-    throw lastErr || new Error('No relay is set up for this quest’s region.');
+    if (isObj(res) && (res.ok === false || (typeof res.status === 'number' && res.status >= 400))) throw res;
+    var body = isObj(res) && isObj(res.body) ? res.body : res;
+    if (!isObj(body) || !(body.enrolled_at || body.enrolledAt)) throw new Error('Server reply had no enrolled_at, so this was not confirmed.');
   }
   async function acceptList(list, setMsg) {
     var ok = 0, fail = [], delay = cfgNow().acceptDelay;
@@ -751,10 +638,6 @@
     var goneN = all.filter(function (x) { return x.status === 'gone'; }).length;
     var stubCount = all.filter(function (x) { return !x.known; }).length;
     var TI = V.components.SearchInput || Design.TextInput || RN.TextInput;
-    var rl = parseRelays(c.relays);
-    function textOf(x) { return typeof x === 'string' ? x : ((x && x.nativeEvent && x.nativeEvent.text) || ''); }
-    function onRelays(x) { set({ relays: textOf(x) }); }
-    function onKey(x) { set({ relayKey: textOf(x).trim() }); }
     function onText(x) { qS[1](typeof x === 'string' ? x : ((x && x.nativeEvent && x.nativeEvent.text) || '')); }
 
     function confirmAccept(list, title) {
@@ -777,40 +660,32 @@
     }
     var regionAge = regionsAt ? Math.max(0, Math.round((Date.now() - regionsAt) / 3600000)) + 'h ago' : 'never';
 
+    // what the user should do next, in one sentence
+    var lockedList = all.filter(function (x) { return x.status === 'locked'; });
+    var ccLocked = countryCounts(lockedList);
+    var vpnTop = ccLocked.top.slice(0, 3);
+    function vpnHelp() {
+      var lines = ccLocked.top.slice(0, 8).map(function (code) { return flag(code, true) + ': unlocks ' + ccLocked.counts[code] + ' quest' + (ccLocked.counts[code] === 1 ? '' : 's'); });
+      RN.Alert.alert('Quests your region does not get', (lines.length ? lines.join('\n') + '\n\n' : '') +
+        '1. Turn on a VPN app set to the country with the most quests (a split-tunnel for Discord is enough).\n2. Come back here and tap “Retry refused quests”.\n3. Tap “Accept all live hidden”.\n\nThe VPN can be turned off again after accepting.');
+    }
+    var next;
+    if (!d.storeFound) next = { label: 'Open Discord’s Quests screen once', sub: 'The plugin needs it to load before it can list anything.' };
+    else if (lockedN && !liveHidden.length) next = { label: lockedN + ' quest' + (lockedN === 1 ? '' : 's') + ' not offered in your region', sub: (vpnTop.length ? 'Best VPN country: ' + vpnTop.map(function (k) { return flag(k) + ' ' + ccLocked.counts[k]; }).join('  ') + '. ' : '') + 'Tap for the steps.', press: vpnHelp };
+    else if (liveHidden.length) next = { label: liveHidden.length + ' hidden quest' + (liveHidden.length === 1 ? ' is' : 's are') + ' ready to accept', sub: 'Tap to accept them all.', press: function () { confirmAccept(liveHidden, 'Accept ' + liveHidden.length + ' hidden quests?'); } };
+    else next = { label: 'Nothing hidden is live right now', sub: 'You will get an alert when a new quest appears.' };
+    var q = qS[0];
+
     return h(RN.ScrollView, { style: { flex: 1 }, contentContainerStyle: { paddingBottom: 24 } },
       h(V.components.Page, null,
-        h(Design.TableRowGroup, { title: 'Status' },
-          h(Design.TableRow, { label: d.storeFound ? 'Quest store found' : 'Quest store NOT found', subLabel: 'Open Discord\u2019s Quests screen once so everything loads.' }),
-          h(Design.TableRow, { label: all.length + ' quests: ' + live.length + ' available, ' + hiddenCount + ' hidden by client (' + liveHidden.length + ' hidden and available' + (lockedN ? ', ' + lockedN + ' refused as unknown' : '') + (goneN ? ', ' + goneN + ' expired' : '') + ')' }),
-          h(Design.TableRow, { label: 'Names: ' + (all.length - stubCount) + ' of ' + all.length + ' quests have details' + (stubCount ? ' (' + stubCount + ' only an id)' : ''), subLabel: 'Hidden quests arrive from Discord as bare ids. Details come from a community tracker (' + metaStatus + '). Quests newer than the tracker stay as ids. Tap to download.', onPress: function () { setMsg('Downloading quest details...'); loadMeta(true).then(function (okM) { setMsg(okM ? 'Quest details updated.' : 'Quest details: ' + metaStatus); }); } }),
-          h(Design.TableRow, (function () {
-            var e = enrollLog[enrollLog.length - 1];
-            if (!e) return { label: 'Last accept: none yet', subLabel: 'Every accept, including Discord\u2019s own button, is recorded here with the server\u2019s answer.' };
-            var q = all.filter(function (x) { return x.id === e.id; })[0];
-            return {
-              label: 'Last accept: ' + (e.ok ? 'worked' : 'refused') + ' \u00b7 ' + (q && q.known ? q.name : e.id) + ' \u00b7 ' + e.src,
-              subLabel: e.text + (e.sent ? ' (sent ' + e.sent + ')' : '') + '. Tap to copy the last ' + enrollLog.length + '.',
-              onPress: function () { copyText(JSON.stringify(enrollLog.map(function (z) { return { id: z.id, ok: z.ok, by: z.src, reply: z.text, sent: z.sent, secondsAgo: Math.round((Date.now() - z.at) / 1000) }; }), null, 2), setMsg); }
-            };
-          })()),
-          h(Design.TableRow, { label: 'Live check: ' + probeStatus, subLabel: 'Asks Discord if each hidden quest is still active (newest 25 at a time). Tap to run now.', onPress: function () { setMsg('Checking with Discord...'); loadProbe().then(function () { setMsg('Live check: ' + probeStatus); }); } }),
-          !!skippedHidden && h(Design.TableRow, { label: skippedHidden + ' hidden quest(s) not added to Discord\u2019s list', subLabel: 'No details for them yet, so Discord\u2019s quest card could not draw them.' }),
-          h(Design.TableRow, { label: hasHttp ? 'Accept: Discord HTTP client found' : 'Accept: Discord HTTP client NOT found', subLabel: 'Open the Quests screen once if it is missing.' }),
-          h(Design.TableRow, { label: 'Regions: ' + regionStatus, subLabel: 'Updated ' + regionAge + '. Community list, may be out of date. Tap to refresh.', onPress: function () { setMsg('Updating regions...'); loadRegions(true).then(function (okR) { setMsg(okR ? 'Regions updated.' : 'Regions: ' + regionStatus); }); } }),
-          !!msgS[0] && h(Design.TableRow, { label: msgS[0] })),
+        h(Design.TableRowGroup, { title: 'Next step' },
+          h(Design.TableRow, { label: next.label, subLabel: next.sub, onPress: next.press }),
+          !!msgS[0] && h(Design.TableRow, { label: msgS[0], onPress: function () { setMsg(''); }, subLabel: 'Tap to dismiss.' })),
 
-        h(Design.TableRowGroup, { title: 'Options' },
-          h(Design.TableSwitchRow, { label: 'Show live hidden quests in Discord\u2019s Quests screen', subLabel: 'Adds hidden quests that are available or accepted to the native list. Reload after changing.', value: !!c.showHidden, onValueChange: function (v) { set({ showHidden: v }); } }),
-          h(Design.TableSwitchRow, { label: 'Download quest names automatically', subLabel: 'About 5 MB from GitHub, at most every 6 hours, only when hidden quests have no details.', value: !!c.autoMeta, onValueChange: function (v) { set({ autoMeta: v }); } }),
-          h(Design.TableSwitchRow, { label: 'Check hidden quests with Discord', subLabel: 'Small, spaced-out requests that confirm a quest is still active and fetch its name.', value: !!c.autoProbe, onValueChange: function (v) { set({ autoProbe: v }); } }),
-          h(Design.TableSwitchRow, { label: 'Alert me about new quests', subLabel: 'Says when a new quest is a hidden one.', value: !!c.alertNew, onValueChange: function (v) { set({ alertNew: v }); } }),
-          h(Design.TableSwitchRow, { label: 'Soonest-expiring first', value: !!c.sortSoonest, onValueChange: function (v) { set({ sortSoonest: v }); } }),
-          h(Design.TableRow, { label: 'Delay between accepts: ' + (c.acceptDelay / 1000) + 's', subLabel: 'Tap to cycle 1s / 1.5s / 3s / 5s.', onPress: function () { set({ acceptDelay: cycle([1000, 1500, 3000, 5000], c.acceptDelay) }); } })),
-
-        h(Design.TableRowGroup, { title: 'Actions' },
+        h(Design.TableRowGroup, { title: 'Accept' },
           h(Design.TableRow, {
             label: 'Accept all live hidden (' + liveHidden.length + ')',
-            subLabel: 'Only hidden quests that are available now. Skips expired, accepted and finished ones.',
+            subLabel: 'Hidden quests that are available now. Skips expired, accepted and finished ones.',
             onPress: function () { confirmAccept(liveHidden, 'Accept ' + liveHidden.length + ' hidden quests?'); }
           }),
           h(Design.TableRow, {
@@ -820,9 +695,57 @@
           }),
           h(Design.TableRow, {
             label: 'Retry refused quests' + (lockedN + goneN ? ' (' + (lockedN + goneN) + ')' : ''),
-            subLabel: 'Forget what Discord refused so they are checked again, e.g. after turning a VPN on or off.',
-            onPress: function () { goneMap = {}; lockedMap = {}; probeNextAt = 0; setMsg('Cleared. Refresh the quests, then run the live check.'); }
+            subLabel: 'Forget what Discord refused so it is checked again, e.g. after turning a VPN on or off.',
+            onPress: function () { goneMap = {}; lockedMap = {}; probeNextAt = 0; setMsg('Cleared. Refreshing...'); var m = enrollModule(); Promise.resolve(m && m.fetchCurrentQuests()).then(function () { return loadProbe(); }).then(function () { setMsg('Checked again: ' + probeStatus); }, function () { setMsg('Cleared. Pull to refresh the Quests screen.'); }); }
           }),
+          !!lockedN && h(Design.TableRow, { label: 'Why are some refused?', subLabel: 'Discord does not offer them in your region. Tap for what to do.', onPress: vpnHelp })),
+
+        // inputs go straight in the Page (like Valenced's own plugins), not inside a TableRowGroup
+        h(TI, { value: q, placeholder: 'Search name, reward, game, type, country code', size: 'md', onChange: onText, onChangeText: onText }),
+        h(Design.TableRowGroup, { title: 'Quests (' + view.length + ' of ' + all.length + ')' },
+          h(Design.TableRow, { label: 'Show: ' + c.filter, subLabel: 'Tap to change: ' + FILTERS.join(' / '), onPress: function () { set({ filter: cycle(FILTERS, c.filter) }); } }),
+          h(Design.TableRow, { label: 'Region: ' + c.region, subLabel: 'Tap to change: ' + REGION_FILTERS.join(' / ') + '. You can also search a country code like US or IQ.', onPress: function () { set({ region: cycle(REGION_FILTERS, c.region) }); } }),
+          cc.top.length > 0 && h(Design.TableRow, {
+            label: 'Unlock by country: ' + cc.top.slice(0, 4).map(function (code) { return flag(code) + ' ' + cc.counts[code]; }).join('  '),
+            subLabel: 'Live hidden quests each country would show you. Tap for the full list.',
+            onPress: showCountries
+          }),
+          view.length === 0
+            ? h(Design.TableRow, { label: q ? 'No quests match “' + q + '”' : 'No quests in this view', subLabel: q ? 'Clear the search or change “Show”.' : 'Try “Show: all”.' })
+            : view.map(function (x) {
+                var types = x.types.map(function (t) { return TYPE_LABELS[t] || t.toLowerCase(); }).join(', ');
+                return h(Design.TableRow, {
+                  key: x.id, label: x.known ? x.name : 'Quest ' + x.id,
+                  subLabel: [x.status === 'unverified' ? 'unverified' : x.status === 'old' ? 'probably expired' : x.status === 'gone' ? 'expired' : x.status === 'locked' ? 'not offered to you' : x.status, x.hidden ? 'hidden (' + hiddenReason(x) + ')' : '', regionLabel(x.id), x.app, types, x.reward ? 'reward: ' + x.reward : '', Number.isFinite(x.progress) && x.status === 'enrolled' ? x.progress + '%' : '', timeLeft(x.expMs)].filter(Boolean).join(' · '),
+                  onPress: function () { openQuest(x); }
+                });
+              })),
+
+        h(Design.TableRowGroup, { title: 'Options' },
+          h(Design.TableSwitchRow, { label: 'Show live hidden quests in Discord’s Quests screen', subLabel: 'Adds hidden quests that are available or accepted to the native list. Reload after changing.', value: !!c.showHidden, onValueChange: function (v) { set({ showHidden: v }); } }),
+          h(Design.TableSwitchRow, { label: 'Alert me about new quests', subLabel: 'Says when a new quest is a hidden one.', value: !!c.alertNew, onValueChange: function (v) { set({ alertNew: v }); } }),
+          h(Design.TableSwitchRow, { label: 'Soonest-expiring first', value: !!c.sortSoonest, onValueChange: function (v) { set({ sortSoonest: v }); } }),
+          h(Design.TableSwitchRow, { label: 'Download quest names automatically', subLabel: 'About 5 MB from GitHub, at most every 6 hours, only when hidden quests have no details.', value: !!c.autoMeta, onValueChange: function (v) { set({ autoMeta: v }); } }),
+          h(Design.TableSwitchRow, { label: 'Check hidden quests with Discord', subLabel: 'Small, spaced-out requests that confirm a quest is still active.', value: !!c.autoProbe, onValueChange: function (v) { set({ autoProbe: v }); } }),
+          h(Design.TableRow, { label: 'Delay between accepts: ' + (c.acceptDelay / 1000) + 's', subLabel: 'Tap to change: 1s / 1.5s / 3s / 5s.', onPress: function () { set({ acceptDelay: cycle([1000, 1500, 3000, 5000], c.acceptDelay) }); } })),
+
+        h(Design.TableRowGroup, { title: 'Details and tools' },
+          h(Design.TableRow, { label: all.length + ' quests: ' + live.length + ' available, ' + hiddenCount + ' hidden by client' + (lockedN ? ', ' + lockedN + ' not offered' : '') + (goneN ? ', ' + goneN + ' expired' : '') }),
+          h(Design.TableRow, { label: 'Names: ' + (all.length - stubCount) + ' of ' + all.length + ' have details' + (stubCount ? ' (' + stubCount + ' only an id)' : ''), subLabel: 'From a community tracker (' + metaStatus + '). Quests newer than it stay as ids. Tap to download.', onPress: function () { setMsg('Downloading quest details...'); loadMeta(true).then(function (okM) { setMsg(okM ? 'Quest details updated.' : 'Quest details: ' + metaStatus); }); } }),
+          h(Design.TableRow, { label: 'Regions: ' + regionStatus, subLabel: 'Updated ' + regionAge + '. Community list, may be out of date. Tap to refresh.', onPress: function () { setMsg('Updating regions...'); loadRegions(true).then(function (okR) { setMsg(okR ? 'Regions updated.' : 'Regions: ' + regionStatus); }); } }),
+          h(Design.TableRow, { label: 'Live check: ' + probeStatus, subLabel: 'Asks Discord if each hidden quest is still active (newest 25 at a time). Tap to run now.', onPress: function () { setMsg('Checking with Discord...'); loadProbe().then(function () { setMsg('Live check: ' + probeStatus); }); } }),
+          h(Design.TableRow, (function () {
+            var e = enrollLog[enrollLog.length - 1];
+            if (!e) return { label: 'Last accept: none yet', subLabel: 'Every accept, including Discord’s own button, is recorded here with the server’s answer.' };
+            var qq = all.filter(function (x) { return x.id === e.id; })[0];
+            return {
+              label: 'Last accept: ' + (e.ok ? 'worked' : 'refused') + ' · ' + (qq && qq.known ? qq.name : e.id) + ' · ' + e.src,
+              subLabel: e.text + (e.sent ? ' (sent ' + e.sent + ')' : '') + '. Tap to copy the last ' + enrollLog.length + '.',
+              onPress: function () { copyText(JSON.stringify(enrollLog.map(function (z) { return { id: z.id, ok: z.ok, by: z.src, reply: z.text, sent: z.sent, secondsAgo: Math.round((Date.now() - z.at) / 1000) }; }), null, 2), setMsg); }
+            };
+          })()),
+          !!skippedHidden && h(Design.TableRow, { label: skippedHidden + ' hidden quest(s) not added to Discord’s list', subLabel: 'No details for them yet, so Discord’s quest card could not draw them.' }),
+          (!d.storeFound || !hasHttp) && h(Design.TableRow, { label: (d.storeFound ? '' : 'Quest store NOT found. ') + (hasHttp ? '' : 'Discord HTTP client NOT found.'), subLabel: 'Open Discord’s Quests screen once, then come back.' }),
           h(Design.TableRow, {
             label: 'Refresh quests from Discord',
             onPress: function () {
@@ -831,44 +754,7 @@
               Promise.resolve(m.fetchCurrentQuests()).then(function () { setMsg('Refreshed.'); }, function () { setMsg('Refresh failed.'); });
             }
           }),
-          h(Design.TableRow, { label: 'Copy everything as JSON', subLabel: 'Raw quests plus store/hook keys, copied to the clipboard.', onPress: function () { copyText(safe(d), setMsg); } })),
-
-        // inputs go straight in the Page (like Valenced's own plugins), not inside a TableRowGroup
-        h(TI, { value: qS[0], placeholder: 'Search name, reward, game, type, country code', size: 'md', onChange: onText, onChangeText: onText }),
-        h(Design.TableRowGroup, { title: 'Relay (your own server in the quest\u2019s country)' },
-          h(Design.TableRow, {
-            label: rl.count ? 'Relays: ' + Object.keys(rl.map).map(function (k) { return flag(k); }).join(' ') + (rl.any ? ' + default' : '') + (c.relayOn ? '' : ' (off)') : 'Relays: none set',
-            subLabel: (relayStatus ? relayStatus + '. ' : '') + (rl.bad.length ? 'Ignored (must be https://): ' + rl.bad.join(', ') + '. ' : '') + 'Token ' + (getToken() ? 'found' : 'NOT found') + '. Set up the relay server from Valenced/relay in the repo.'
-          }),
-          h(Design.TableSwitchRow, { label: 'Use relay for region-locked quests', value: !!c.relayOn, onValueChange: function (v) { set({ relayOn: v }); } }),
-          h(TI, { value: c.relays, placeholder: 'DE=https://de.example.com US=https://us.example.com', size: 'md', onChange: onRelays, onChangeText: onRelays }),
-          h(TI, { value: c.relayKey, placeholder: 'Relay key (the RELAY_KEY you started it with)', size: 'md', onChange: onKey, onChangeText: onKey }),
-          h(Design.TableRow, {
-            label: 'Test relays',
-            subLabel: 'Asks each relay which country it really is in and warns if that differs from the code you set.',
-            onPress: function () { testRelays(rl, String(c.relayKey || ''), setMsg); }
-          })),
-
-        h(Design.TableRowGroup, { title: 'Find' },
-          h(Design.TableRow, {
-            label: cc.top.length ? 'Unlock by country: ' + cc.top.slice(0, 4).map(function (code) { return flag(code) + ' ' + cc.counts[code]; }).join('  ') : 'Unlock by country: no region data yet',
-            subLabel: liveHidden.length + ' live hidden quests. ' + (cc.globalN ? '\uD83C\uDF10 ' + cc.globalN + ' global. ' : '') + 'Tap for the full list.',
-            onPress: showCountries
-          }),
-          h(Design.TableRow, { label: 'Filter: ' + c.filter, subLabel: 'Tap to cycle: ' + FILTERS.join(' / '), onPress: function () { set({ filter: cycle(FILTERS, c.filter) }); } }),
-          h(Design.TableRow, { label: 'Region: ' + c.region, subLabel: 'Tap to cycle: ' + REGION_FILTERS.join(' / ') + '. You can also search a code like US or IQ.', onPress: function () { set({ region: cycle(REGION_FILTERS, c.region) }); } })),
-
-        h(Design.TableRowGroup, { title: 'Quests (' + view.length + ')' },
-          view.length === 0
-            ? h(Design.TableRow, { label: 'No matching quests' })
-            : view.map(function (x) {
-                var types = x.types.map(function (t) { return TYPE_LABELS[t] || t.toLowerCase(); }).join(', ');
-                return h(Design.TableRow, {
-                  key: x.id, label: x.known ? x.name : 'Quest ' + x.id,
-                  subLabel: [x.status === 'unverified' ? 'unverified' : x.status === 'old' ? 'probably expired' : x.status === 'gone' ? 'expired' : x.status === 'locked' ? 'not offered to you' : x.status, x.hidden ? 'hidden (' + hiddenReason(x) + ')' : '', regionLabel(x.id), x.app, types, x.reward ? 'reward: ' + x.reward : '', Number.isFinite(x.progress) && x.status === 'enrolled' ? x.progress + '%' : '', timeLeft(x.expMs)].filter(Boolean).join(' \u00b7 '),
-                  onPress: function () { openQuest(x); }
-                });
-              }))));
+          h(Design.TableRow, { label: 'Copy everything as JSON', subLabel: 'Raw quests plus store/hook keys, for bug reports.', onPress: function () { copyText(safe(d), setMsg); } }))));
   }
 
   // ---------- plugin ----------
@@ -922,7 +808,6 @@
         } catch (e) { ctx.plugin.reportError(e); }
       }
       patchHttp();
-      try { V.discord.flux.getStore('AuthenticationStore', function (st) { authStore = st; }); } catch (e) { /* falls back to a module lookup */ }
 
       // new-quest alerts
       var seenMemo = null;
@@ -956,7 +841,6 @@
         if (isObj(cs.meta) && Object.keys(cs.meta).length) setMeta(cs.meta, Number(cs.metaAt) || 0);
         if (isObj(cs.gone)) Object.keys(cs.gone).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.gone[k] === 'number') goneMap[k] = cs.gone[k]; });
         if (isObj(cs.locked)) Object.keys(cs.locked).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.locked[k] === 'number') lockedMap[k] = cs.locked[k]; });
-        if (isObj(cs.done)) Object.keys(cs.done).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.done[k] === 'number') doneMap[k] = cs.done[k]; });
         loadRegions(false);
         timer = setInterval(function () { patchHttp(); if (RN.AppState.currentState === 'active') { maybeMeta(); maybeProbe(); } check(); }, 8000);
         check();

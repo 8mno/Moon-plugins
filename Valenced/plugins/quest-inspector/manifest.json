@@ -5,7 +5,7 @@
   "description": "See every quest your Discord client has (including hidden ones), get alerts for new quests, and accept quests from one place.",
   "author": "Moon",
   "icon": "QuestsIcon",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "dependencies": {
     "valenced.api": {
       "version": ">=1 <2"
