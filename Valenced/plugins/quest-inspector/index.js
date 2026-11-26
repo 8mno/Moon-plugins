@@ -5,8 +5,8 @@
   // One line per VPN: { name: 'Shown name', url: 'https://link' }. Only https:// links are used.
   var VPN_LINKS = [
     { name: 'Proton VPN (free plan)', url: 'https://protonvpn.com/free-vpn' },
-    { name: 'Windscribe (free plan)', url: 'https://windscribe.com/' }
-    // , { name: 'Ninja VPN', url: 'https://...' }
+    { name: 'Windscribe (free plan)', url: 'https://windscribe.com/' },
+    { name: 'Ninja VPN', url: 'https://ninjavpn.app/' }
   ];
   // =========================================================================================
 
@@ -102,16 +102,37 @@
     try {
       V.externals.ReactNativeClipboard.Clipboard.setString(text);
       setMsg('Copied ' + text.length + ' characters to the clipboard.');
-      toast('QI_COPIED', 'Copied to clipboard');
+      toast('QI_COPIED', 'Copied to clipboard', false, 'copy');
       return;
     } catch (e) {}
     try { RN.Share.share({ message: text }); }
     catch (e2) { setMsg('Could not copy or share.'); }
   }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
-  function toast(key, text, bad) {
+  // Toast icons are Discord's own icon components, looked up by name (the same way Valenced's own toasts do it).
+  // A name that does not exist just gives no icon.
+  var iconCache = {};
+  function icon(names) {
+    var key = names.join('|');
+    if (Object.prototype.hasOwnProperty.call(iconCache, key)) return iconCache[key];
+    var found;
+    for (var i = 0; i < names.length && !found; i++) {
+      try { found = V.utils.discord.lookupGeneratedIconComponent(names[i]); } catch (e) { found = undefined; }
+    }
+    if (found) iconCache[key] = found;   // a miss is retried later, in case the modules were not loaded yet
+    return found;
+  }
+  var ICONS = {
+    new: ['QuestsIcon', 'GiftIcon'], ok: ['CircleCheckIcon'], bad: ['CircleXIcon', 'FileWarningIcon'],
+    copy: ['CopyIcon'], clock: ['ClockIcon', 'ClockWarningIcon', 'TimerIcon'], globe: ['GlobeEarthIcon']
+  };
+  function toast(key, text, bad, kind) {
     try {
-      V.discord.actions.ToastActionCreators.open(key, bad ? { text: text, variant: 'critical' } : { text: text });
+      var o = { text: text };
+      if (bad) o.variant = 'critical';
+      var ic = icon(ICONS[kind || (bad ? 'bad' : 'new')] || []);
+      if (ic) o.icon = ic;
+      V.discord.actions.ToastActionCreators.open(key, o);
     } catch (e) {}
   }
   function cfgNow() {
@@ -249,7 +270,7 @@
   // a VPN was switched on or off: what Discord refused before may be offered now
   function onCountryChanged(prev, cc) {
     lockedMap = {}; probeNextAt = 0;
-    toast('QI_COUNTRY', 'Your country is now ' + flag(cc) + ' ' + cc + '. Checking quests again...');
+    toast('QI_COUNTRY', 'Your country is now ' + flag(cc) + ' ' + cc + '. Checking quests again...', false, 'globe');
     var m = enrollModule();
     if (m) { try { Promise.resolve(m.fetchCurrentQuests()).catch(function () {}); } catch (e) {} }
   }
@@ -679,7 +700,7 @@
     var m = enrollModule();
     if (m) { try { await m.fetchCurrentQuests(); } catch (e) {} }
     setMsg('Server confirmed ' + ok + '/' + list.length + (fail.length ? '. Failed: ' + fail.join('; ') : '.'));
-    toast('QI_ACCEPT', ok + '/' + list.length + ' quests enrolled', ok === 0 && list.length > 0);
+    toast('QI_ACCEPT', ok + '/' + list.length + ' quests enrolled', ok === 0 && list.length > 0, ok === 0 && list.length > 0 ? 'bad' : 'ok');
     try {
       var lines = [];
       if (okNames.length) lines.push('Accepted:\n' + okNames.slice(0, 8).map(function (n) { return '\u2022 ' + n; }).join('\n'));
@@ -1024,7 +1045,7 @@
             var tier = left <= 3 * 3600000 ? '3' : '24', key = x.id + ':' + tier;
             if (remMemo.has(key)) return;
             remMemo.add(key); remMemo.add(x.id + ':24'); changed = true;
-            toast('QI_EXP_' + key, '\u23F0 ' + (x.known ? x.name : 'A quest') + ' expires in ' + timeLeft(x.expMs).replace(' left', '') + (Number.isFinite(x.progress) ? ' (' + x.progress + '% done)' : ''));
+            toast('QI_EXP_' + key, (x.known ? x.name : 'A quest') + ' expires in ' + timeLeft(x.expMs).replace(' left', '') + (Number.isFinite(x.progress) ? ' (' + x.progress + '% done)' : ''), false, 'clock');
           });
           if (changed) ctx.jsonStorage.set({ reminded: Array.from(remMemo).slice(-300) }).catch(function () {});
         } catch (e) { ctx.plugin.reportError(e); }
