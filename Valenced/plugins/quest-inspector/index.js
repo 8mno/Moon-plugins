@@ -28,12 +28,13 @@
     meta: {},            // cached quest configs for hidden quests, see META_URLS
     metaAt: 0,
     autoProbe: true,     // ask Discord (GET /quests/{id}) whether hidden quests are still active
-    gone: {},            // quest id -> when Discord said it is not active
+    gone: {},            // quest id -> when Discord said it has expired
+    locked: {},          // quest id -> when Discord said it is unknown (not offered to this account/region)
     acceptDelay: 1500,   // ms between "Accept all" requests
     seeded: false,
     seen: []
   };
-  var FILTERS = ['live hidden', 'all', 'available', 'enrolled', 'hidden', 'finished'];
+  var FILTERS = ['live hidden', 'all', 'available', 'enrolled', 'hidden', 'finished', 'not offered'];
   var REGION_FILTERS = ['any', 'global', 'regional'];
   // Third-party, community-kept list of which countries each quest is limited to. It is only used
   // for display, can be out of date, and the plugin works without it.
@@ -48,7 +49,8 @@
   var LIVE_STATUSES = ['available', 'unverified'];
   var PROBE_MAX = 25;                      // quests asked about per run
   var PROBE_MAX_AGE_DAYS = 60;             // older ids are not worth asking about
-  var PROBE_GONE_TTL = 24 * 3600 * 1000;   // how long "not active" is remembered
+  var PROBE_GONE_TTL = 24 * 3600 * 1000;   // how long "expired" is remembered
+  var LOCKED_TTL = 30 * 60 * 1000;         // how long "not offered to you" is remembered (short, so a new VPN gets a fresh try)
   var PROBE_GAP = 500;                     // ms between requests
   var QUEST_HOME_MOBILE = 12;   // "location" Discord's accept request needs (QUEST_HOME_MOBILE)
   var DESKTOP_ONLY = ['PLAY_ON_DESKTOP', 'PLAY_ON_XBOX', 'PLAY_ON_PLAYSTATION', 'STREAM_ON_DESKTOP'];
@@ -205,8 +207,22 @@
     var t = own(goneMap, id);
     return typeof t === 'number' && Date.now() - t < PROBE_GONE_TTL;
   }
+  var lockedMap = {};        // quest id -> timestamp of the last "unknown quest" answer
+  function isLocked(id) {
+    var t = own(lockedMap, id);
+    return typeof t === 'number' && Date.now() - t < LOCKED_TTL;
+  }
+  // 260017 = "Quest has expired"; 260008 = "Unknown quest" (the server does not offer it to this account)
+  function refusalKind(e) {
+    if (!isObj(e)) return null;
+    var body = isObj(e.body) ? e.body : {};
+    var t = errText(e);
+    if (body.code === 260017 || /expired|has ended|no longer/i.test(t)) return 'gone';
+    if (body.code === 260008 || /unknown quest/i.test(t) || e.status === 404) return 'locked';
+    return null;
+  }
   function probeCandidates() {
-    return stubIds().filter(function (id) { return !isGone(id) && idAgeDays(id) <= PROBE_MAX_AGE_DAYS; })
+    return stubIds().filter(function (id) { return !isGone(id) && !isLocked(id) && idAgeDays(id) <= PROBE_MAX_AGE_DAYS; })
       .sort(function (a, b) { return idAgeDays(a) - idAgeDays(b); });   // newest first
   }
   function loadProbe() {
@@ -221,7 +237,7 @@
     if (!http || typeof http.get !== 'function') { probeStatus = 'Discord HTTP client not found'; return false; }
     var todo = probeCandidates();
     if (todo.length === 0) { probeStatus = 'nothing to check'; probeNextAt = Date.now() + META_RETRY_OK; return false; }
-    var batch = todo.slice(0, PROBE_MAX), found = {}, gone = {}, n = { ok: 0, gone: 0, err: 0 }, lastErr = '';
+    var batch = todo.slice(0, PROBE_MAX), found = {}, gone = {}, locked = {}, n = { ok: 0, gone: 0, locked: 0, err: 0 }, lastErr = '';
     probeStatus = 'checking ' + batch.length + '...';
     for (var i = 0; i < batch.length; i++) {
       try {
@@ -231,7 +247,9 @@
         if (isObj(cfg) && isObj(cfg.messages)) { found[batch[i]] = camelize(cfg); n.ok++; }
         else { n.err++; lastErr = 'reply had no quest data'; }
       } catch (e) {
-        if (isObj(e) && e.status === 404) { gone[batch[i]] = Date.now(); n.gone++; }
+        var kind = isObj(e) && e.status === 404 ? refusalKind(e) : null;
+        if (kind === 'gone') { gone[batch[i]] = Date.now(); n.gone++; }
+        else if (kind === 'locked') { locked[batch[i]] = Date.now(); n.locked++; }
         else {
           n.err++; lastErr = errText(e);
           if (isObj(e) && e.status === 429) break;
@@ -241,10 +259,11 @@
     }
     if (n.ok) setMeta(Object.assign({}, metaMap, found), metaAt || Date.now());
     Object.assign(goneMap, gone);
+    Object.assign(lockedMap, locked);
     probeNextAt = Date.now() + (todo.length > batch.length ? 15 * 60000 : META_RETRY_OK);
-    probeStatus = n.ok + ' active, ' + n.gone + ' not active, ' + n.err + ' unclear' + (lastErr ? ' (' + lastErr + ')' : '');
-    try { if (storageRef) await storageRef.set({ meta: found, gone: gone }); } catch (e2) {}
-    return n.ok + n.gone > 0;
+    probeStatus = n.ok + ' active, ' + n.gone + ' expired, ' + n.locked + ' not offered to you, ' + n.err + ' unclear' + (lastErr ? ' (' + lastErr + ')' : '');
+    try { if (storageRef) await storageRef.set({ meta: found, gone: gone, locked: locked }); } catch (e2) {}
+    return n.ok + n.gone + n.locked > 0;
   }
   function maybeProbe() {
     if (probing || metaLoading || Date.now() < probeNextAt || !cfgNow().autoProbe) return;
@@ -403,8 +422,11 @@
       : (us.enrolledAt || us.enrolled_at) ? 'enrolled' : 'available';
     out.known = isObj(cfg.messages);
     // a stub with no details has no expiry, so guess from the age of its id: quests last weeks, not months
-    if (!out.known && out.status === 'available') out.status = isGone(out.id) ? 'gone' : (out.id && idAgeDays(out.id) <= 30 ? 'unverified' : 'old');
-    if (isGone(out.id) && (out.status === 'available' || out.status === 'unverified' || out.status === 'old')) out.status = 'gone';
+    if (!out.known && out.status === 'available') out.status = out.id && idAgeDays(out.id) <= 30 ? 'unverified' : 'old';
+    if (out.status === 'available' || out.status === 'unverified' || out.status === 'old') {
+      if (isGone(out.id)) out.status = 'gone';
+      else if (isLocked(out.id)) out.status = 'locked';
+    }
     return out;
   }
 
@@ -452,6 +474,7 @@
       if (f === 'available' && LIVE_STATUSES.indexOf(x.status) < 0) return false;
       if (f === 'enrolled' && x.status !== 'enrolled') return false;
       if (f === 'hidden' && !x.hidden) return false;
+      if (f === 'not offered' && x.status !== 'locked') return false;
       if (f === 'live hidden' && !(x.hidden && (LIVE_STATUSES.indexOf(x.status) >= 0 || x.status === 'enrolled'))) return false;
       if (c.region === 'global' && regionKind(x.id) !== 'global') return false;
       if (c.region === 'regional' && regionKind(x.id) !== 'regional') return false;
@@ -479,14 +502,13 @@
     enrollLog.push({ id: id, ok: ok, text: String(text).slice(0, 300), src: src, sent: sent || '', at: Date.now() });
     if (enrollLog.length > 12) enrollLog.shift();
   }
-  // "unknown / ended" answers mean the quest is not there for us any more: take it off the live list
-  function markGone(id, e) {
-    if (!isObj(e)) return;
-    var t = errText(e);
-    if (e.status !== 404 && !/unknown quest|has ended|ended|expired|not active|no longer/i.test(t)) return;
-    goneMap[id] = Date.now();
-    var one = {}; one[id] = goneMap[id];
-    try { if (storageRef) storageRef.set({ gone: one }).catch(function () {}); } catch (e2) {}
+  // Remember a refusal so the quest leaves the live list: expired for a day, "not offered" for 30 minutes
+  function markRefused(id, e) {
+    var kind = refusalKind(e);
+    if (!kind) return;
+    var one = {}; one[id] = Date.now();
+    (kind === 'gone' ? goneMap : lockedMap)[id] = one[id];
+    try { if (storageRef) storageRef.set(kind === 'gone' ? { gone: one } : { locked: one }).catch(function () {}); } catch (e2) {}
   }
   function bodyPreview(b) { try { return JSON.stringify(b).slice(0, 200); } catch (e) { return ''; } }
 
@@ -612,12 +634,18 @@
       if (cc.unknown) lines.push('region unknown: ' + cc.unknown);
       RN.Alert.alert('Live hidden quests by country', lines.length ? lines.join('\n') : 'Nothing to count yet.');
     }
+    var lockedN = all.filter(function (x) { return x.status === 'locked'; }).length;
+    var goneN = all.filter(function (x) { return x.status === 'gone'; }).length;
     var stubCount = all.filter(function (x) { return !x.known; }).length;
     var TI = V.components.SearchInput || Design.TextInput || RN.TextInput;
     function onText(x) { qS[1](typeof x === 'string' ? x : ((x && x.nativeEvent && x.nativeEvent.text) || '')); }
 
     function confirmAccept(list, title) {
-      if (busyS[0] || list.length === 0) return;
+      if (busyS[0]) { setMsg('Already accepting, please wait.'); return; }
+      if (list.length === 0) {
+        setMsg('Nothing to accept. ' + (lockedN ? lockedN + ' quest(s) were refused by Discord as unknown, which usually means they are not offered to your region or account. ' : '') + (goneN ? goneN + ' have expired. ' : '') + 'Tap \u201cRetry refused quests\u201d after changing region.');
+        return;
+      }
       RN.Alert.alert(title, 'Each request goes to Discord and is only counted if the server confirms it.', [
         { text: 'Cancel', style: 'cancel' },
         { text: 'Accept', onPress: function () { busyS[1](true); acceptList(list, setMsg).finally(function () { busyS[1](false); }); } }
@@ -625,10 +653,10 @@
     }
     function openQuest(x) {
       var buttons = [];
-      if (LIVE_STATUSES.indexOf(x.status) >= 0) buttons.push({ text: 'Accept', onPress: function () { acceptList([x], setMsg); } });
+      if (LIVE_STATUSES.indexOf(x.status) >= 0 || x.status === 'locked') buttons.push({ text: x.status === 'locked' ? 'Try accept anyway' : 'Accept', onPress: function () { acceptList([x], setMsg); } });
       buttons.push({ text: 'Open in Discord', onPress: function () { RN.Linking.openURL('https://discord.com/quests/' + encodeURIComponent(x.id)); } });
       buttons.push({ text: 'Copy JSON', onPress: function () { copyText(safe(x.q), setMsg); } });
-      RN.Alert.alert(x.name, [x.status === 'unverified' ? 'unverified (no details yet)' : x.status === 'old' ? 'probably expired' : x.status === 'gone' ? 'not active (Discord says)' : x.status, x.hidden ? 'hidden: ' + hiddenReason(x) : '', regionLabel(x.id, true), x.reward ? 'reward: ' + x.reward : '', timeLeft(x.expMs)].filter(Boolean).join('\n'), buttons);
+      RN.Alert.alert(x.name, [x.status === 'unverified' ? 'unverified (no details yet)' : x.status === 'old' ? 'probably expired' : x.status === 'gone' ? 'expired (Discord says)' : x.status === 'locked' ? 'not offered to you (Discord: unknown quest)' : x.status, x.hidden ? 'hidden: ' + hiddenReason(x) : '', regionLabel(x.id, true), x.reward ? 'reward: ' + x.reward : '', timeLeft(x.expMs)].filter(Boolean).join('\n'), buttons);
     }
     var regionAge = regionsAt ? Math.max(0, Math.round((Date.now() - regionsAt) / 3600000)) + 'h ago' : 'never';
 
@@ -636,7 +664,7 @@
       h(V.components.Page, null,
         h(Design.TableRowGroup, { title: 'Status' },
           h(Design.TableRow, { label: d.storeFound ? 'Quest store found' : 'Quest store NOT found', subLabel: 'Open Discord\u2019s Quests screen once so everything loads.' }),
-          h(Design.TableRow, { label: all.length + ' quests: ' + live.length + ' available, ' + hiddenCount + ' hidden by client (' + liveHidden.length + ' hidden and available)' }),
+          h(Design.TableRow, { label: all.length + ' quests: ' + live.length + ' available, ' + hiddenCount + ' hidden by client (' + liveHidden.length + ' hidden and available' + (lockedN ? ', ' + lockedN + ' refused as unknown' : '') + (goneN ? ', ' + goneN + ' expired' : '') + ')' }),
           h(Design.TableRow, { label: 'Names: ' + (all.length - stubCount) + ' of ' + all.length + ' quests have details' + (stubCount ? ' (' + stubCount + ' only an id)' : ''), subLabel: 'Hidden quests arrive from Discord as bare ids. Details come from a community tracker (' + metaStatus + '). Quests newer than the tracker stay as ids. Tap to download.', onPress: function () { setMsg('Downloading quest details...'); loadMeta(true).then(function (okM) { setMsg(okM ? 'Quest details updated.' : 'Quest details: ' + metaStatus); }); } }),
           h(Design.TableRow, (function () {
             var e = enrollLog[enrollLog.length - 1];
@@ -674,6 +702,11 @@
             onPress: function () { confirmAccept(live, 'Accept ' + live.length + ' quests?'); }
           }),
           h(Design.TableRow, {
+            label: 'Retry refused quests' + (lockedN + goneN ? ' (' + (lockedN + goneN) + ')' : ''),
+            subLabel: 'Forget what Discord refused so they are checked again, e.g. after turning a VPN on or off.',
+            onPress: function () { goneMap = {}; lockedMap = {}; probeNextAt = 0; setMsg('Cleared. Refresh the quests, then run the live check.'); }
+          }),
+          h(Design.TableRow, {
             label: 'Refresh quests from Discord',
             onPress: function () {
               var m = enrollModule();
@@ -701,7 +734,7 @@
                 var types = x.types.map(function (t) { return TYPE_LABELS[t] || t.toLowerCase(); }).join(', ');
                 return h(Design.TableRow, {
                   key: x.id, label: x.known ? x.name : 'Quest ' + x.id,
-                  subLabel: [x.status === 'unverified' ? 'unverified' : x.status === 'old' ? 'probably expired' : x.status === 'gone' ? 'not active' : x.status, x.hidden ? 'hidden (' + hiddenReason(x) + ')' : '', regionLabel(x.id), x.app, types, x.reward ? 'reward: ' + x.reward : '', Number.isFinite(x.progress) && x.status === 'enrolled' ? x.progress + '%' : '', timeLeft(x.expMs)].filter(Boolean).join(' \u00b7 '),
+                  subLabel: [x.status === 'unverified' ? 'unverified' : x.status === 'old' ? 'probably expired' : x.status === 'gone' ? 'expired' : x.status === 'locked' ? 'not offered to you' : x.status, x.hidden ? 'hidden (' + hiddenReason(x) + ')' : '', regionLabel(x.id), x.app, types, x.reward ? 'reward: ' + x.reward : '', Number.isFinite(x.progress) && x.status === 'enrolled' ? x.progress + '%' : '', timeLeft(x.expMs)].filter(Boolean).join(' \u00b7 '),
                   onPress: function () { openQuest(x); }
                 });
               }))));
@@ -750,7 +783,7 @@
                 var id = m[1], src = viaPlugin > 0 ? 'plugin' : 'Discord', sent = bodyPreview(o.body);
                 Promise.resolve(p).then(function (r) {
                   recordEnroll(id, true, 'HTTP ' + (isObj(r) && r.status ? r.status : 'ok') + ' ' + bodyPreview(isObj(r) ? r.body : ''), src, sent);
-                }, function (e) { recordEnroll(id, false, errText(e), src, sent); markGone(id, e); });
+                }, function (e) { recordEnroll(id, false, errText(e), src, sent); markRefused(id, e); });
               }
             } catch (e) { /* never let logging break a request */ }
             return p;
@@ -790,6 +823,7 @@
         if (isObj(cs.regions) && Object.keys(cs.regions).length) setRegions(cs.regions, Number(cs.regionsAt) || 0);
         if (isObj(cs.meta) && Object.keys(cs.meta).length) setMeta(cs.meta, Number(cs.metaAt) || 0);
         if (isObj(cs.gone)) Object.keys(cs.gone).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.gone[k] === 'number') goneMap[k] = cs.gone[k]; });
+        if (isObj(cs.locked)) Object.keys(cs.locked).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.locked[k] === 'number') lockedMap[k] = cs.locked[k]; });
         loadRegions(false);
         timer = setInterval(function () { patchHttp(); if (RN.AppState.currentState === 'active') { maybeMeta(); maybeProbe(); } check(); }, 8000);
         check();
