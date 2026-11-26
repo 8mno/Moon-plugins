@@ -27,6 +27,9 @@
     autoMeta: true,      // download quest names/details for hidden quests (about 5 MB, at most every 6 hours)
     meta: {},            // cached quest configs for hidden quests, see META_URLS
     metaAt: 0,
+    detectIp: true,      // find your country from your IP (api.country.is, then ipwho.is), through the same connection Discord uses
+    learned: {},         // quest id -> {y:[countries it worked from], n:[countries Discord refused it from]}
+    vpns: '',            // your own VPN links: Name=https://link; Other=https://link
     autoProbe: true,     // ask Discord (GET /quests/{id}) whether hidden quests are still active
     gone: {},            // quest id -> when Discord said it has expired
     locked: {},          // quest id -> when Discord said it is unknown (not offered to this account/region)
@@ -198,6 +201,61 @@
     metaNextAt = Date.now() + META_RETRY_FAIL;
     loadMeta(false);
   }
+  // ---------- which country you are in right now (IP based) ----------
+  // The request is made from inside Discord's app, so it takes the same route as Discord's own traffic:
+  // when a VPN is on for Discord, this sees the VPN's country.
+  var ipCountry = { cc: '', at: 0, status: 'not checked' };
+  var GEO_SOURCES = [
+    { url: 'https://api.country.is/', pick: function (j) { return j && j.country; } },
+    { url: 'https://ipwho.is/', pick: function (j) { return j && j.success !== false && j.country_code; } }
+  ];
+  var geoLoading = null;
+  function detectCountry(force) {
+    if (!force && ipCountry.cc && Date.now() - ipCountry.at < 5 * 60000) return Promise.resolve(false);
+    if (!force && !ipCountry.cc && ipCountry.at && Date.now() - ipCountry.at < 2 * 60000) return Promise.resolve(false);
+    if (!geoLoading) geoLoading = doDetect().then(function (r) { geoLoading = null; return r; }, function () { geoLoading = null; return false; });
+    return geoLoading;
+  }
+  async function doDetect() {
+    var prev = ipCountry.cc, cc = '', err = '';
+    for (var i = 0; i < GEO_SOURCES.length && !cc; i++) {
+      try {
+        var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+        var t = ctrl ? setTimeout(function () { ctrl.abort(); }, 8000) : null;
+        var res = await fetch(GEO_SOURCES[i].url, ctrl ? { signal: ctrl.signal } : undefined);
+        if (t) clearTimeout(t);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        var v = String(GEO_SOURCES[i].pick(await res.json()) || '').toUpperCase();
+        if (/^[A-Z]{2}$/.test(v)) cc = v; else throw new Error('no country in reply');
+      } catch (e) { err = (e && e.message) || String(e); }
+    }
+    ipCountry.at = Date.now();
+    if (!cc) { ipCountry.status = 'failed: ' + err; return false; }
+    ipCountry.cc = cc; ipCountry.status = 'from your IP';
+    if (prev && prev !== cc) onCountryChanged(prev, cc);
+    return true;
+  }
+  // a VPN was switched on or off: what Discord refused before may be offered now
+  function onCountryChanged(prev, cc) {
+    lockedMap = {}; probeNextAt = 0;
+    toast('QI_COUNTRY', 'Your country is now ' + flag(cc) + ' ' + cc + '. Checking quests again...');
+    var m = enrollModule();
+    if (m) { try { Promise.resolve(m.fetchCurrentQuests()).catch(function () {}); } catch (e) {} }
+  }
+  // what the server itself told us about a quest from a given country, kept so unknown regions fill in over time
+  var learnedMap = {};
+  function learn(id, ok) {
+    var cc = ipCountry.cc;
+    if (!cc || !/^\d{5,25}$/.test(id)) return;
+    var r = own(learnedMap, id) || { y: [], n: [] };
+    var from = ok ? 'y' : 'n', other = ok ? 'n' : 'y';
+    if (r[from].indexOf(cc) < 0) r[from] = r[from].concat(cc).slice(-8);
+    r[other] = r[other].filter(function (c) { return c !== cc; });
+    learnedMap[id] = r;
+    var one = {}; one[id] = r;
+    try { if (storageRef) storageRef.set({ learned: one }).catch(function () {}); } catch (e) {}
+  }
+
   // ---------- asking Discord whether a hidden quest is still active ----------
   var goneMap = {};          // quest id -> timestamp of the last "not active" answer
   var probeStatus = 'not run yet';
@@ -244,12 +302,12 @@
         var res = await http.get({ url: '/quests/' + encodeURIComponent(batch[i]), retries: 0 });
         var body = isObj(res) && isObj(res.body) ? res.body : res;
         var cfg = isObj(body) && isObj(body.config) ? body.config : body;
-        if (isObj(cfg) && isObj(cfg.messages)) { found[batch[i]] = camelize(cfg); n.ok++; }
+        if (isObj(cfg) && isObj(cfg.messages)) { found[batch[i]] = camelize(cfg); n.ok++; learn(batch[i], true); }
         else { n.err++; lastErr = 'reply had no quest data'; }
       } catch (e) {
         var kind = isObj(e) && e.status === 404 ? refusalKind(e) : null;
         if (kind === 'gone') { gone[batch[i]] = Date.now(); n.gone++; }
-        else if (kind === 'locked') { locked[batch[i]] = Date.now(); n.locked++; }
+        else if (kind === 'locked') { locked[batch[i]] = Date.now(); n.locked++; learn(batch[i], false); }
         else {
           n.err++; lastErr = errText(e);
           if (isObj(e) && e.status === 429) break;
@@ -352,7 +410,7 @@
   // Which country Discord thinks you are in is not exposed anywhere, but it can be worked out: every
   // regional quest Discord really shows you (not hidden, still available) must allow your country.
   // Intersect their include lists and drop their exclude lists; what is left is your country.
-  var userRegion = { codes: [], n: 0 };
+  var userRegion = { codes: [], n: 0, from: '', guess: [] };
   function inferRegion(list) {
     var cand = null, banned = {}, n = 0;
     list.forEach(function (x) {
@@ -373,7 +431,11 @@
   }
   // 'yes' | 'no' | 'maybe' | 'unknown': would Discord show this quest to the country you are in now?
   function access(id) {
-    var r = regionFor(id), me = userRegion.codes;
+    var r = regionFor(id), me = userRegion.codes, L = own(learnedMap, id);
+    if (L && me.length && (!r || (!r.g && !r.i.length && !r.e.length))) {
+      if (L.y.some(function (c) { return me.indexOf(c) >= 0; })) return 'yes';
+      if (L.n.some(function (c) { return me.indexOf(c) >= 0; })) return 'no';
+    }
     if (!r || !me.length) return 'unknown';
     if (r.g) return 'yes';
     var ok = me.filter(function (c) { return (!r.i.length || r.i.indexOf(c) >= 0) && r.e.indexOf(c) < 0; }).length;
@@ -382,7 +444,13 @@
   }
   function regionLabel(id, long) {
     var r = regionFor(id);
-    if (!r) return regionsAt ? '\u2754 not in the region list yet' : '';
+    if (!r) {
+      var L = own(learnedMap, id), seen = [];
+      if (L && L.y.length) seen.push('works from ' + flags(L.y, 4));
+      if (L && L.n.length) seen.push('refused from ' + flags(L.n, 4));
+      if (seen.length) return '\uD83D\uDD0D ' + seen.join(' \u00b7 ');
+      return regionsAt ? '\u2754 region unknown (not in the list yet)' : '';
+    }
     var age = r.a ? ' \uD83D\uDD1E' : '';
     if (r.g) return '\uD83C\uDF10 global' + age;
     var parts = [];
@@ -409,7 +477,12 @@
     var counts = Object.create(null), globalN = 0, open = 0, unknown = 0;
     list.forEach(function (x) {
       var r = regionFor(x.id);
-      if (!r) { unknown++; return; }
+      if (!r) {
+        var L = own(learnedMap, x.id);
+        if (L && L.y.length) L.y.forEach(function (c) { if (userRegion.codes.indexOf(c) < 0) counts[c] = (counts[c] || 0) + 1; });
+        else unknown++;
+        return;
+      }
       if (r.g) { globalN++; return; }
       if (r.i.length) r.i.forEach(function (c) { if (userRegion.codes.indexOf(c) < 0) counts[c] = (counts[c] || 0) + 1; });
       else open++;
@@ -498,7 +571,8 @@
       info.hidden = !!e.flags.excluded && !e.flags.shown;
       return info;
     });
-    userRegion = inferRegion(infos);
+    var guess = inferRegion(infos);
+    userRegion = cfgNow().detectIp && ipCountry.cc ? { codes: [ipCountry.cc], n: guess.n, from: 'ip', guess: guess.codes } : { codes: guess.codes, n: guess.n, from: 'quests', guess: guess.codes };
     return infos;
   }
 
@@ -542,6 +616,7 @@
     if (!kind) return;
     var one = {}; one[id] = Date.now();
     (kind === 'gone' ? goneMap : lockedMap)[id] = one[id];
+    if (kind === 'locked') learn(id, false);
     try { if (storageRef) storageRef.set(kind === 'gone' ? { gone: one } : { locked: one }).catch(function () {}); } catch (e2) {}
   }
   function bodyPreview(b) { try { return JSON.stringify(b).slice(0, 200); } catch (e) { return ''; } }
@@ -572,6 +647,7 @@
     if (isObj(res) && (res.ok === false || (typeof res.status === 'number' && res.status >= 400))) throw res;
     var body = isObj(res) && isObj(res.body) ? res.body : res;
     if (!isObj(body) || !(body.enrolled_at || body.enrolledAt)) throw new Error('Server reply had no enrolled_at, so this was not confirmed.');
+    learn(x.id, true);
   }
   async function acceptList(list, setMsg) {
     var ok = 0, fail = [], okNames = [], lockedCount = 0, delay = cfgNow().acceptDelay;
@@ -643,6 +719,18 @@
   }
 
   // ---------- settings UI ----------
+  // VPN links: a few built-in ones, plus whatever you type as "Name=https://link; Other=https://link"
+  var VPN_DEFAULTS = [{ name: 'Proton VPN (free plan)', url: 'https://protonvpn.com/free-vpn' }, { name: 'Windscribe (free plan)', url: 'https://windscribe.com/' }];
+  function parseVpns(str) {
+    var out = VPN_DEFAULTS.slice();
+    String(str || '').split(/[;\n]+/).forEach(function (part) {
+      var m = /^\s*([^=]{1,40}?)\s*=\s*(https:\/\/[^\s]+)\s*$/.exec(part);
+      if (!m) return;
+      out = out.filter(function (v) { return v.name.toLowerCase() !== m[1].toLowerCase(); });
+      out.push({ name: m[1], url: m[2] });
+    });
+    return out;
+  }
   var STATUS_ICON = { available: '\uD83D\uDFE2', unverified: '\uD83D\uDFE1', enrolled: '\u2705', completed: '\uD83C\uDFC1', claimed: '\uD83C\uDF81', expired: '\u231B', gone: '\u231B', old: '\u231B', locked: '\uD83D\uDD12' };
   var STATUS_WORD = { available: 'available', unverified: 'unverified', enrolled: 'accepted', completed: 'completed', claimed: 'claimed', expired: 'expired', gone: 'expired', old: 'probably expired', locked: 'not offered to you' };
   function statusIcon(x) { return STATUS_ICON[x.status] || '\u2B1C'; }
@@ -726,6 +814,8 @@
     else if (liveHidden.length) next = { label: liveHidden.length + ' hidden quest' + (liveHidden.length === 1 ? ' is' : 's are') + ' ready to accept', sub: 'Tap to accept them all.', press: function () { confirmAccept(liveHidden, 'Accept ' + liveHidden.length + ' hidden quests?'); } };
     else next = { label: 'Nothing hidden is live right now', sub: 'You will get an alert when a new quest appears.' };
     var q = qS[0];
+    var vpnList = parseVpns(c.vpns);
+    function onVpns(x) { set({ vpns: typeof x === 'string' ? x : ((x && x.nativeEvent && x.nativeEvent.text) || '') }); }
 
     return h(RN.ScrollView, { style: { flex: 1 }, contentContainerStyle: { paddingBottom: 24 } },
       h(V.components.Page, null,
@@ -754,10 +844,11 @@
         // inputs go straight in the Page (like Valenced's own plugins), not inside a TableRowGroup
         h(TI, { value: q, placeholder: 'Search name, reward, game, type, country code', size: 'md', onChange: onText, onChangeText: onText }),
         h(Design.TableRowGroup, { title: 'Quests (' + view.length + ' of ' + all.length + ')' },
-          h(Design.TableRow, {
-            label: userRegion.codes.length ? 'Your region: ' + flags(userRegion.codes, 4) + ' (' + userRegion.codes.join(', ') + ')' : 'Your region: not known yet',
-            subLabel: userRegion.codes.length ? 'Worked out from the ' + userRegion.n + ' region-limited quests Discord shows you now. It follows your VPN after a refresh.' : 'Needs at least one region-limited quest that Discord already shows you.'
-          }),
+          h(Design.TableRow, (function () {
+            if (userRegion.from === 'ip') return { label: 'Your country: ' + flag(ipCountry.cc) + ' ' + ipCountry.cc, subLabel: 'From your IP, so it follows a VPN. ' + (userRegion.guess.length && userRegion.guess.indexOf(ipCountry.cc) < 0 ? 'The quests Discord shows you point to ' + flags(userRegion.guess, 3) + ', so Discord may see you elsewhere. ' : '') + 'Tap to check again.', onPress: function () { setMsg('Checking your country...'); detectCountry(true).then(function () { setMsg(ipCountry.cc ? 'You are in ' + ipCountry.cc + '.' : 'Country check ' + ipCountry.status); }); } };
+            if (userRegion.codes.length) return { label: 'Your region: ' + flags(userRegion.codes, 4) + ' (' + userRegion.codes.join(', ') + ')', subLabel: 'Guessed from the ' + userRegion.n + ' region-limited quests Discord shows you. Tap to try your IP instead.', onPress: function () { detectCountry(true).then(function () { setMsg(ipCountry.cc ? 'You are in ' + ipCountry.cc + '.' : 'Country check ' + ipCountry.status); }); } };
+            return { label: 'Your country: not known yet', subLabel: (c.detectIp ? 'IP check ' + ipCountry.status + '. ' : 'IP check is off in Options. ') + 'Tap to try.', onPress: function () { detectCountry(true).then(function () { setMsg(ipCountry.cc ? 'You are in ' + ipCountry.cc + '.' : 'Country check ' + ipCountry.status); }); } };
+          })()),
           h(Design.TableRow, { label: 'Show: ' + c.filter + ' (' + view.length + ')', subLabel: 'Tap to change. Next: ' + cycle(FILTERS, c.filter) + '. All options: ' + FILTERS.join(', ') + '.', onPress: function () { set({ filter: cycle(FILTERS, c.filter) }); } }),
           h(Design.TableRow, { label: 'Region: ' + c.region, subLabel: 'Tap to change: ' + REGION_FILTERS.join(' / ') + '. You can also search a country code like US or IQ.', onPress: function () { set({ region: cycle(REGION_FILTERS, c.region) }); } }),
           cc.top.length > 0 && h(Design.TableRow, {
@@ -777,8 +868,14 @@
                 });
               })),
 
+        h(Design.TableRowGroup, { title: 'VPN apps' },
+          h(Design.TableRow, { label: vpnTop.length ? 'Best country now: ' + vpnTop.map(function (k) { return flag(k) + ' ' + k; }).join('  ') : 'Pick a country that unlocks the most quests', subLabel: 'Switch the VPN to it, and the plugin notices and re-checks by itself.', onPress: vpnHelp }),
+          vpnList.map(function (v) { return h(Design.TableRow, { key: v.name, label: v.name, subLabel: v.url.replace(/^https:\/\//, ''), onPress: function () { RN.Linking.openURL(v.url).catch(function () { setMsg('Could not open ' + v.url); }); } }); }),
+          h(TI, { value: c.vpns, placeholder: 'Add your own: Name=https://link; Other=https://link', size: 'md', onChange: onVpns, onChangeText: onVpns })),
+
         h(Design.TableRowGroup, { title: 'Options' },
           h(Design.TableSwitchRow, { label: 'Show live hidden quests in Discord’s Quests screen', subLabel: 'Adds hidden quests that are available or accepted to the native list. Reload after changing.', value: !!c.showHidden, onValueChange: function (v) { set({ showHidden: v }); } }),
+          h(Design.TableSwitchRow, { label: 'Find my country from my IP', subLabel: 'Asks api.country.is (then ipwho.is) which country your connection is in. Nothing else is sent.', value: !!c.detectIp, onValueChange: function (v) { set({ detectIp: v }); if (v) detectCountry(true); } }),
           h(Design.TableSwitchRow, { label: 'Alert me about new quests', subLabel: 'Says when a new quest is a hidden one.', value: !!c.alertNew, onValueChange: function (v) { set({ alertNew: v }); } }),
           h(Design.TableSwitchRow, { label: 'Soonest-expiring first', value: !!c.sortSoonest, onValueChange: function (v) { set({ sortSoonest: v }); } }),
           h(Design.TableSwitchRow, { label: 'Download quest names automatically', subLabel: 'About 5 MB from GitHub, at most every 6 hours, only when hidden quests have no details.', value: !!c.autoMeta, onValueChange: function (v) { set({ autoMeta: v }); } }),
@@ -897,8 +994,10 @@
         if (isObj(cs.meta) && Object.keys(cs.meta).length) setMeta(cs.meta, Number(cs.metaAt) || 0);
         if (isObj(cs.gone)) Object.keys(cs.gone).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.gone[k] === 'number') goneMap[k] = cs.gone[k]; });
         if (isObj(cs.locked)) Object.keys(cs.locked).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.locked[k] === 'number') lockedMap[k] = cs.locked[k]; });
+        if (isObj(cs.learned)) Object.keys(cs.learned).forEach(function (k) { var r = cs.learned[k]; if (/^\d{5,25}$/.test(k) && isObj(r) && Array.isArray(r.y) && Array.isArray(r.n)) learnedMap[k] = { y: codeList(r.y), n: codeList(r.n) }; });
         loadRegions(false);
-        timer = setInterval(function () { patchHttp(); if (RN.AppState.currentState === 'active') { maybeMeta(); maybeProbe(); } check(); }, 8000);
+        if (cs.detectIp) detectCountry(true);
+        timer = setInterval(function () { patchHttp(); if (RN.AppState.currentState === 'active') { if (cfgNow().detectIp) detectCountry(false); maybeMeta(); maybeProbe(); } check(); }, 8000);
         check();
       });
       cleanup(function () { if (timer) clearInterval(timer); });
