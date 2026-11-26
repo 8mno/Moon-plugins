@@ -1,6 +1,15 @@
 (function (exports) {
   var V = valenced;
 
+  // ==================== EDIT HERE: the VPN links shown in the settings ====================
+  // One line per VPN: { name: 'Shown name', url: 'https://link' }. Only https:// links are used.
+  var VPN_LINKS = [
+    { name: 'Proton VPN (free plan)', url: 'https://protonvpn.com/free-vpn' },
+    { name: 'Windscribe (free plan)', url: 'https://windscribe.com/' }
+    // , { name: 'Ninja VPN', url: 'https://...' }
+  ];
+  // =========================================================================================
+
   // Valenced evaluates this script *before* Discord's index module is initialized (preInit).
   // Reading e.g. valenced.discord.design at that point throws, which kills the plugin at boot
   // (it shows as disabled after a reload, with no settings gear). So nothing from the valenced
@@ -29,7 +38,9 @@
     metaAt: 0,
     detectIp: true,      // find your country from your IP (api.country.is, then ipwho.is), through the same connection Discord uses
     learned: {},         // quest id -> {y:[countries it worked from], n:[countries Discord refused it from]}
-    vpns: '',            // your own VPN links: Name=https://link; Other=https://link
+    remind: true,        // toast when an accepted quest is about to expire
+    reminded: [],        // reminders already shown (quest id + tier)
+    intro: false,        // the first-open how-to was shown
     autoProbe: true,     // ask Discord (GET /quests/{id}) whether hidden quests are still active
     gone: {},            // quest id -> when Discord said it has expired
     locked: {},          // quest id -> when Discord said it is unknown (not offered to this account/region)
@@ -511,12 +522,16 @@
     if (!out.reward && orbs > 0) out.reward = orbs + ' orbs';
     var tasks = isObj(tc) && isObj(tc.tasks) ? tc.tasks : null;
     var prog = isObj(us.progress) ? us.progress : null;
+    out.taskText = [];
     if (tasks && prog) {
       var sum = 0, n = 0;
       Object.keys(tasks).forEach(function (k) {
         var target = isObj(tasks[k]) ? Number(tasks[k].target) : NaN;
         if (!(target > 0)) return;
-        sum += Math.min((isObj(prog[k]) ? Number(prog[k].value) || 0 : 0) / target, 1); n++;
+        var val = isObj(prog[k]) ? Number(prog[k].value) || 0 : 0;
+        sum += Math.min(val / target, 1); n++;
+        var secs = ['WATCH_VIDEO', 'WATCH_VIDEO_ON_MOBILE', 'PLAY_ON_DESKTOP', 'PLAY_ON_XBOX', 'PLAY_ON_PLAYSTATION', 'PLAY_ACTIVITY', 'STREAM_ON_DESKTOP'].indexOf(k) >= 0 && target >= 60;
+        out.taskText.push((TYPE_LABELS[k] || k.toLowerCase()) + ' ' + (secs ? Math.floor(Math.min(val, target) / 60) + '/' + Math.floor(target / 60) + ' min' : Math.min(val, target) + '/' + target));
       });
       if (n) out.progress = Math.round(sum / n * 100);
     }
@@ -719,18 +734,8 @@
   }
 
   // ---------- settings UI ----------
-  // VPN links: a few built-in ones, plus whatever you type as "Name=https://link; Other=https://link"
-  var VPN_DEFAULTS = [{ name: 'Proton VPN (free plan)', url: 'https://protonvpn.com/free-vpn' }, { name: 'Windscribe (free plan)', url: 'https://windscribe.com/' }];
-  function parseVpns(str) {
-    var out = VPN_DEFAULTS.slice();
-    String(str || '').split(/[;\n]+/).forEach(function (part) {
-      var m = /^\s*([^=]{1,40}?)\s*=\s*(https:\/\/[^\s]+)\s*$/.exec(part);
-      if (!m) return;
-      out = out.filter(function (v) { return v.name.toLowerCase() !== m[1].toLowerCase(); });
-      out.push({ name: m[1], url: m[2] });
-    });
-    return out;
-  }
+  var VPN_OK = VPN_LINKS.filter(function (v) { return v && typeof v.name === 'string' && typeof v.url === 'string' && /^https:\/\/[^\s]+$/.test(v.url); });
+  function bar(pct) { var n = Math.max(0, Math.min(10, Math.round(pct / 10))); return '\u25B0'.repeat(n) + '\u25B1'.repeat(10 - n); }
   var STATUS_ICON = { available: '\uD83D\uDFE2', unverified: '\uD83D\uDFE1', enrolled: '\u2705', completed: '\uD83C\uDFC1', claimed: '\uD83C\uDF81', expired: '\u231B', gone: '\u231B', old: '\u231B', locked: '\uD83D\uDD12' };
   var STATUS_WORD = { available: 'available', unverified: 'unverified', enrolled: 'accepted', completed: 'completed', claimed: 'claimed', expired: 'expired', gone: 'expired', old: 'probably expired', locked: 'not offered to you' };
   function statusIcon(x) { return STATUS_ICON[x.status] || '\u2B1C'; }
@@ -753,6 +758,9 @@
     var setMsg = msgS[1];
     function set(p) { if (storage) storage.set(p).catch(function () { setMsg('Could not save setting.'); }); }
 
+    React.useEffect(function () {
+      if (storage && !c.intro) { set({ intro: true }); setTimeout(howTo, 400); }
+    }, []);
     React.useEffect(function () {
       var i = setInterval(function () { tick[1](function (t) { return t + 1; }); }, 4000);
       return function () { clearInterval(i); };
@@ -814,14 +822,27 @@
     else if (liveHidden.length) next = { label: liveHidden.length + ' hidden quest' + (liveHidden.length === 1 ? ' is' : 's are') + ' ready to accept', sub: 'Tap to accept them all.', press: function () { confirmAccept(liveHidden, 'Accept ' + liveHidden.length + ' hidden quests?'); } };
     else next = { label: 'Nothing hidden is live right now', sub: 'You will get an alert when a new quest appears.' };
     var q = qS[0];
-    var vpnList = parseVpns(c.vpns);
-    function onVpns(x) { set({ vpns: typeof x === 'string' ? x : ((x && x.nativeEvent && x.nativeEvent.text) || '') }); }
+    var active = all.filter(function (x) { return x.status === 'enrolled'; }).sort(function (a, b) { return (Number.isFinite(a.expMs) ? a.expMs : Infinity) - (Number.isFinite(b.expMs) ? b.expMs : Infinity); });
+    function howTo() {
+      RN.Alert.alert('How to use Quest Inspector', '1. Open Discord\u2019s Quests screen once so the quests load.\n2. The top row tells you the next step. Tap \u201cAccept all live hidden\u201d to accept every hidden quest that is live.\n3. If Discord refuses quests for your region, turn on a VPN in the country shown under \u201cVPN apps\u201d. The plugin notices the new country and checks again.\n4. Accepted quests show their progress at the top, and you get a reminder before they expire.');
+    }
 
     return h(RN.ScrollView, { style: { flex: 1 }, contentContainerStyle: { paddingBottom: 24 } },
       h(V.components.Page, null,
         h(Design.TableRowGroup, { title: 'Next step' },
           h(Design.TableRow, { label: next.label, subLabel: next.sub, onPress: next.press }),
+          h(Design.TableRow, { label: 'How to use', subLabel: 'A 30-second guide.', onPress: howTo }),
           !!msgS[0] && h(Design.TableRow, { label: msgS[0], onPress: function () { setMsg(''); }, subLabel: 'Tap to dismiss.' })),
+
+        !!active.length && h(Design.TableRowGroup, { title: 'In progress (' + active.length + ')' },
+          active.map(function (x) {
+            var pct = Number.isFinite(x.progress) ? x.progress : 0;
+            return h(Design.TableRow, {
+              key: x.id, label: x.known ? x.name : 'Quest ' + String(x.id).slice(-8),
+              subLabel: [bar(pct) + ' ' + pct + '%', x.taskText.join(', '), x.reward, timeLeft(x.expMs)].filter(Boolean).join(' \u00b7 '),
+              onPress: function () { openQuest(x); }
+            });
+          })),
 
         h(Design.TableRowGroup, { title: 'Accept' },
           h(Design.TableRow, {
@@ -870,12 +891,13 @@
 
         h(Design.TableRowGroup, { title: 'VPN apps' },
           h(Design.TableRow, { label: vpnTop.length ? 'Best country now: ' + vpnTop.map(function (k) { return flag(k) + ' ' + k; }).join('  ') : 'Pick a country that unlocks the most quests', subLabel: 'Switch the VPN to it, and the plugin notices and re-checks by itself.', onPress: vpnHelp }),
-          vpnList.map(function (v) { return h(Design.TableRow, { key: v.name, label: v.name, subLabel: v.url.replace(/^https:\/\//, ''), onPress: function () { RN.Linking.openURL(v.url).catch(function () { setMsg('Could not open ' + v.url); }); } }); }),
-          h(TI, { value: c.vpns, placeholder: 'Add your own: Name=https://link; Other=https://link', size: 'md', onChange: onVpns, onChangeText: onVpns })),
+          VPN_OK.map(function (v) { return h(Design.TableRow, { key: v.name, label: v.name, subLabel: v.url.replace(/^https:\/\//, ''), onPress: function () { RN.Linking.openURL(v.url).catch(function () { setMsg('Could not open ' + v.url); }); } }); }),
+          VPN_OK.length === 0 && h(Design.TableRow, { label: 'No VPN links yet', subLabel: 'Add them in the VPN_LINKS list at the top of the plugin code.' })),
 
         h(Design.TableRowGroup, { title: 'Options' },
           h(Design.TableSwitchRow, { label: 'Show live hidden quests in Discord’s Quests screen', subLabel: 'Adds hidden quests that are available or accepted to the native list. Reload after changing.', value: !!c.showHidden, onValueChange: function (v) { set({ showHidden: v }); } }),
           h(Design.TableSwitchRow, { label: 'Find my country from my IP', subLabel: 'Asks api.country.is (then ipwho.is) which country your connection is in. Nothing else is sent.', value: !!c.detectIp, onValueChange: function (v) { set({ detectIp: v }); if (v) detectCountry(true); } }),
+          h(Design.TableSwitchRow, { label: 'Remind me before accepted quests expire', subLabel: 'A toast 24 hours and 3 hours before.', value: !!c.remind, onValueChange: function (v) { set({ remind: v }); } }),
           h(Design.TableSwitchRow, { label: 'Alert me about new quests', subLabel: 'Says when a new quest is a hidden one.', value: !!c.alertNew, onValueChange: function (v) { set({ alertNew: v }); } }),
           h(Design.TableSwitchRow, { label: 'Soonest-expiring first', value: !!c.sortSoonest, onValueChange: function (v) { set({ sortSoonest: v }); } }),
           h(Design.TableSwitchRow, { label: 'Download quest names automatically', subLabel: 'About 5 MB from GitHub, at most every 6 hours, only when hidden quests have no details.', value: !!c.autoMeta, onValueChange: function (v) { set({ autoMeta: v }); } }),
@@ -987,6 +1009,26 @@
           ctx.jsonStorage.set({ seeded: true, seen: Array.from(seenMemo).slice(-500) }).catch(function () {});
         } catch (e) { ctx.plugin.reportError(e); }
       }
+      var remMemo = null;
+      function remind() {
+        try {
+          if (RN.AppState.currentState !== 'active') return;
+          var c = cfgNow();
+          if (!c.remind) return;
+          if (!remMemo) remMemo = new Set(c.reminded);
+          var changed = false;
+          unify(collect()).forEach(function (x) {
+            if (x.status !== 'enrolled' || !Number.isFinite(x.expMs)) return;
+            var left = x.expMs - Date.now();
+            if (left <= 0 || left > 24 * 3600000) return;
+            var tier = left <= 3 * 3600000 ? '3' : '24', key = x.id + ':' + tier;
+            if (remMemo.has(key)) return;
+            remMemo.add(key); remMemo.add(x.id + ':24'); changed = true;
+            toast('QI_EXP_' + key, '\u23F0 ' + (x.known ? x.name : 'A quest') + ' expires in ' + timeLeft(x.expMs).replace(' left', '') + (Number.isFinite(x.progress) ? ' (' + x.progress + '% done)' : ''));
+          });
+          if (changed) ctx.jsonStorage.set({ reminded: Array.from(remMemo).slice(-300) }).catch(function () {});
+        } catch (e) { ctx.plugin.reportError(e); }
+      }
       var timer = null;
       Promise.resolve(ctx.jsonStorage.get()).catch(function () {}).then(function () {
         var cs = cfgNow();
@@ -997,7 +1039,7 @@
         if (isObj(cs.learned)) Object.keys(cs.learned).forEach(function (k) { var r = cs.learned[k]; if (/^\d{5,25}$/.test(k) && isObj(r) && Array.isArray(r.y) && Array.isArray(r.n)) learnedMap[k] = { y: codeList(r.y), n: codeList(r.n) }; });
         loadRegions(false);
         if (cs.detectIp) detectCountry(true);
-        timer = setInterval(function () { patchHttp(); if (RN.AppState.currentState === 'active') { if (cfgNow().detectIp) detectCountry(false); maybeMeta(); maybeProbe(); } check(); }, 8000);
+        timer = setInterval(function () { patchHttp(); if (RN.AppState.currentState === 'active') { if (cfgNow().detectIp) detectCountry(false); maybeMeta(); maybeProbe(); remind(); } check(); }, 8000);
         check();
       });
       cleanup(function () { if (timer) clearInterval(timer); });
