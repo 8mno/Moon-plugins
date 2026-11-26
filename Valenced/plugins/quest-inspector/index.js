@@ -574,11 +574,12 @@
     if (!isObj(body) || !(body.enrolled_at || body.enrolledAt)) throw new Error('Server reply had no enrolled_at, so this was not confirmed.');
   }
   async function acceptList(list, setMsg) {
-    var ok = 0, fail = [], delay = cfgNow().acceptDelay;
+    var ok = 0, fail = [], okNames = [], lockedCount = 0, delay = cfgNow().acceptDelay;
     for (var i = 0; i < list.length; i++) {
       setMsg('Accepting ' + (i + 1) + '/' + list.length + ': ' + list[i].name + '...');
-      try { await enrollOne(list[i]); ok++; }
+      try { await enrollOne(list[i]); ok++; okNames.push(list[i].name); }
       catch (e) {
+        if (refusalKind(e) === 'locked') lockedCount++;
         fail.push(list[i].name + ' [' + errText(e) + ']');
         if (isObj(e) && e.status === 429) { fail.push('Rate limited, stopped.'); break; }
       }
@@ -588,6 +589,13 @@
     if (m) { try { await m.fetchCurrentQuests(); } catch (e) {} }
     setMsg('Server confirmed ' + ok + '/' + list.length + (fail.length ? '. Failed: ' + fail.join('; ') : '.'));
     toast('QI_ACCEPT', ok + '/' + list.length + ' quests enrolled', ok === 0 && list.length > 0);
+    try {
+      var lines = [];
+      if (okNames.length) lines.push('Accepted:\n' + okNames.slice(0, 8).map(function (n) { return '\u2022 ' + n; }).join('\n'));
+      if (fail.length) lines.push('Refused:\n' + fail.slice(0, 5).map(function (n) { return '\u2022 ' + n; }).join('\n'));
+      if (lockedCount) lines.push('Discord does not offer ' + (lockedCount === 1 ? 'this quest' : 'these quests') + ' in your region. Turn on a VPN in one of its countries, then tap \u201cRetry refused quests\u201d.');
+      RN.Alert.alert(ok === list.length ? 'All ' + ok + ' accepted' : ok + ' of ' + list.length + ' accepted', lines.join('\n\n'));
+    } catch (e) { /* the toast and the message row already said it */ }
   }
 
   // ---------- Discord's own Quests screen: optionally show hidden quests ----------
@@ -635,6 +643,15 @@
   }
 
   // ---------- settings UI ----------
+  var STATUS_ICON = { available: '\uD83D\uDFE2', unverified: '\uD83D\uDFE1', enrolled: '\u2705', completed: '\uD83C\uDFC1', claimed: '\uD83C\uDF81', expired: '\u231B', gone: '\u231B', old: '\u231B', locked: '\uD83D\uDD12' };
+  var STATUS_WORD = { available: 'available', unverified: 'unverified', enrolled: 'accepted', completed: 'completed', claimed: 'claimed', expired: 'expired', gone: 'expired', old: 'probably expired', locked: 'not offered to you' };
+  function statusIcon(x) { return STATUS_ICON[x.status] || '\u2B1C'; }
+  function statusWord(x) { return STATUS_WORD[x.status] || x.status; }
+  function shortList(list, max) {
+    var names = list.slice(0, max).map(function (x) { return '\u2022 ' + (x.known ? x.name : 'Quest ' + String(x.id).slice(-6)) + (x.reward ? ' (' + x.reward + ')' : ''); });
+    if (list.length > max) names.push('\u2026and ' + (list.length - max) + ' more');
+    return names.join('\n');
+  }
   function cycle(list, cur) { return list[(list.indexOf(cur) + 1) % list.length]; }
 
   function Inspector(props) {
@@ -680,7 +697,7 @@
         setMsg('Nothing to accept. ' + (lockedN ? lockedN + ' quest(s) were refused by Discord as unknown, which usually means they are not offered to your region or account. ' : '') + (goneN ? goneN + ' have expired. ' : '') + 'Tap \u201cRetry refused quests\u201d after changing region.');
         return;
       }
-      RN.Alert.alert(title, 'Each request goes to Discord and is only counted if the server confirms it.', [
+      RN.Alert.alert(title, shortList(list, 8) + '\n\nEach one is only counted if Discord confirms it.', [
         { text: 'Cancel', style: 'cancel' },
         { text: 'Accept', onPress: function () { busyS[1](true); acceptList(list, setMsg).finally(function () { busyS[1](false); }); } }
       ]);
@@ -690,7 +707,7 @@
       if (LIVE_STATUSES.indexOf(x.status) >= 0 || x.status === 'locked') buttons.push({ text: x.status === 'locked' ? 'Try accept anyway' : 'Accept', onPress: function () { acceptList([x], setMsg); } });
       buttons.push({ text: 'Open in Discord', onPress: function () { RN.Linking.openURL('https://discord.com/quests/' + encodeURIComponent(x.id)); } });
       buttons.push({ text: 'Copy JSON', onPress: function () { copyText(safe(x.q), setMsg); } });
-      RN.Alert.alert(x.name, [x.status === 'unverified' ? 'unverified (no details yet)' : x.status === 'old' ? 'probably expired' : x.status === 'gone' ? 'expired (Discord says)' : x.status === 'locked' ? 'not offered to you (Discord: unknown quest)' : x.status, x.hidden ? 'hidden: ' + hiddenReason(x) : '', regionLabel(x.id, true), x.reward ? 'reward: ' + x.reward : '', timeLeft(x.expMs)].filter(Boolean).join('\n'), buttons);
+      RN.Alert.alert(statusIcon(x) + ' ' + (x.known ? x.name : 'Quest ' + x.id), [statusWord(x) + (x.status === 'locked' ? ' (Discord says unknown quest)' : x.status === 'unverified' ? ' (no details yet)' : ''), x.reward ? 'Reward: ' + x.reward : '', x.app ? 'Game: ' + x.app : '', timeLeft(x.expMs), regionLabel(x.id, true), x.hidden ? 'Hidden: ' + hiddenReason(x) : ''].filter(Boolean).join('\n'), buttons);
     }
     var regionAge = regionsAt ? Math.max(0, Math.round((Date.now() - regionsAt) / 3600000)) + 'h ago' : 'never';
 
@@ -741,7 +758,7 @@
             label: userRegion.codes.length ? 'Your region: ' + flags(userRegion.codes, 4) + ' (' + userRegion.codes.join(', ') + ')' : 'Your region: not known yet',
             subLabel: userRegion.codes.length ? 'Worked out from the ' + userRegion.n + ' region-limited quests Discord shows you now. It follows your VPN after a refresh.' : 'Needs at least one region-limited quest that Discord already shows you.'
           }),
-          h(Design.TableRow, { label: 'Show: ' + c.filter, subLabel: 'Tap to change: ' + FILTERS.join(' / '), onPress: function () { set({ filter: cycle(FILTERS, c.filter) }); } }),
+          h(Design.TableRow, { label: 'Show: ' + c.filter + ' (' + view.length + ')', subLabel: 'Tap to change. Next: ' + cycle(FILTERS, c.filter) + '. All options: ' + FILTERS.join(', ') + '.', onPress: function () { set({ filter: cycle(FILTERS, c.filter) }); } }),
           h(Design.TableRow, { label: 'Region: ' + c.region, subLabel: 'Tap to change: ' + REGION_FILTERS.join(' / ') + '. You can also search a country code like US or IQ.', onPress: function () { set({ region: cycle(REGION_FILTERS, c.region) }); } }),
           cc.top.length > 0 && h(Design.TableRow, {
             label: 'Unlock by country: ' + cc.top.slice(0, 4).map(function (code) { return flag(code) + ' ' + cc.counts[code]; }).join('  '),
@@ -752,9 +769,10 @@
             ? h(Design.TableRow, { label: q ? 'No quests match “' + q + '”' : 'No quests in this view', subLabel: q ? 'Clear the search or change “Show”.' : 'Try “Show: all”.' })
             : view.map(function (x) {
                 var types = x.types.map(function (t) { return TYPE_LABELS[t] || t.toLowerCase(); }).join(', ');
+                var left = x.status === 'expired' || x.status === 'gone' || x.status === 'old' ? '' : timeLeft(x.expMs);
                 return h(Design.TableRow, {
-                  key: x.id, label: x.known ? x.name : 'Quest ' + x.id,
-                  subLabel: [x.status === 'unverified' ? 'unverified' : x.status === 'old' ? 'probably expired' : x.status === 'gone' ? 'expired' : x.status === 'locked' ? 'not offered to you' : x.status, x.hidden ? 'hidden (' + hiddenReason(x) + ')' : '', regionLabel(x.id), x.app, types, x.reward ? 'reward: ' + x.reward : '', Number.isFinite(x.progress) && x.status === 'enrolled' ? x.progress + '%' : '', timeLeft(x.expMs)].filter(Boolean).join(' · '),
+                  key: x.id, label: statusIcon(x) + ' ' + (x.known ? x.name : 'Quest ' + String(x.id).slice(-8)),
+                  subLabel: [statusWord(x), x.reward, left, regionLabel(x.id), x.app, types, x.hidden && x.status !== 'locked' ? 'hidden' : '', Number.isFinite(x.progress) && x.status === 'enrolled' ? x.progress + '% done' : ''].filter(Boolean).join(' \u00b7 '),
                   onPress: function () { openQuest(x); }
                 });
               })),
