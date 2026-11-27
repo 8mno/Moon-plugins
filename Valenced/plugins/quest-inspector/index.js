@@ -43,6 +43,8 @@
     intro: false,        // the first-open how-to was shown
     autoProbe: true,     // ask Discord (GET /quests/{id}) whether hidden quests are still active
     gone: {},            // quest id -> when Discord said it has expired
+    goneClearedAt: 0,    // "Retry refused quests" was pressed at this time: older refusals are ignored
+    lockedClearedAt: 0,
     locked: {},          // quest id -> when Discord said it is unknown (not offered to this account/region)
     acceptDelay: 1500,   // ms between "Accept all" requests
     seeded: false,
@@ -76,6 +78,7 @@
   };
 
   var lastHook = {};        // last results seen from Discord's own quest hooks
+  var lastHookAt = 0;       // when Discord's Quests screen last rendered (its data can be older than our own copy)
   var storageRef = null;    // jsonStorage, set in start()
 
   // ---------- helpers ----------
@@ -252,12 +255,7 @@
     var prev = ipCountry.cc, cc = '', err = '';
     for (var i = 0; i < GEO_SOURCES.length && !cc; i++) {
       try {
-        var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
-        var t = ctrl ? setTimeout(function () { ctrl.abort(); }, 8000) : null;
-        var res = await fetch(GEO_SOURCES[i].url, ctrl ? { signal: ctrl.signal } : undefined);
-        if (t) clearTimeout(t);
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        var v = String(GEO_SOURCES[i].pick(await res.json()) || '').toUpperCase();
+        var v = String(GEO_SOURCES[i].pick(await fetchJson(GEO_SOURCES[i].url, 8000)) || '').toUpperCase();
         if (/^[A-Z]{2}$/.test(v)) cc = v; else throw new Error('no country in reply');
       } catch (e) { err = (e && e.message) || String(e); }
     }
@@ -269,7 +267,7 @@
   }
   // a VPN was switched on or off: what Discord refused before may be offered now
   function onCountryChanged(prev, cc) {
-    lockedMap = {}; probeNextAt = Date.now() + 30000;   // give the new connection a moment before asking Discord again
+    clearRefused('locked'); probeNextAt = Date.now() + 30000;   // give the new connection a moment before asking Discord again
     toast('QI_COUNTRY', 'Your country is now ' + flag(cc, true) + '. Checking quests again...', false, 'globe');
     setTimeout(function () { reloadQuests(); }, 4000);
   }
@@ -277,7 +275,8 @@
   var learnedMap = {};
   function learn(id, ok) {
     var cc = ipCountry.cc;
-    if (!cc || !/^\d{5,25}$/.test(id)) return;
+    // only trust the country if it was checked recently (a VPN may have been switched since)
+    if (!cc || Date.now() - ipCountry.at > 15 * 60000 || !/^\d{5,25}$/.test(id)) return;
     var r = own(learnedMap, id) || { y: [], n: [] };
     var from = ok ? 'y' : 'n', other = ok ? 'n' : 'y';
     if (r[from].indexOf(cc) < 0) r[from] = r[from].concat(cc).slice(-8);
@@ -300,6 +299,14 @@
   function isLocked(id) {
     var t = own(lockedMap, id);
     return typeof t === 'number' && Date.now() - t < LOCKED_TTL;
+  }
+  // Clearing must also reach storage, otherwise the old refusals come back after a restart.
+  // (Storage merges objects, so a key cannot be removed; a "cleared at" time is stored instead.)
+  function clearRefused(which) {
+    lockedMap = {};
+    if (which !== 'locked') goneMap = {};
+    var t = Date.now();
+    try { if (storageRef) storageRef.set(which === 'locked' ? { lockedClearedAt: t } : { goneClearedAt: t, lockedClearedAt: t }).catch(function () {}); } catch (e) {}
   }
   // 260017 = "Quest has expired"; 260008 = "Unknown quest" (the server does not offer it to this account)
   function refusalKind(e) {
@@ -401,7 +408,7 @@
   function loadRegions(force) {
     if (!force && regionsAt && Date.now() - regionsAt < REGIONS_TTL) return Promise.resolve(false);
     if (!regionsLoading) {
-      regionsLoading = fetchRegions().then(function (r) { regionsLoading = null; return r; });
+      regionsLoading = fetchRegions().then(function (r) { regionsLoading = null; return r; }, function () { regionsLoading = null; return false; });
     }
     return regionsLoading;
   }
@@ -409,12 +416,7 @@
     regionStatus = 'loading...';
     var map;
     try {
-      var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
-      var t = ctrl ? setTimeout(function () { ctrl.abort(); }, 15000) : null;
-      var res = await fetch(REGIONS_URL, ctrl ? { signal: ctrl.signal } : undefined);
-      if (t) clearTimeout(t);
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      map = parseRegions(await res.json());
+      map = parseRegions(await fetchJson(REGIONS_URL, 15000));
       if (!map) throw new Error('unexpected format');
     } catch (e) {
       regionStatus = 'failed: ' + (e && e.message ? e.message : e);
@@ -660,14 +662,17 @@
     var s = getStore();
     var f = lastHook.useFilteredQuests;
     var c = lastHook.useClaimedQuests;
+    // After a connection change Discord's own list can be an old answer. When our copy is newer than the
+    // last time its screen rendered, trust ours alone for what is shown and what is hidden.
+    var ours = selfAt > 0 && selfAt >= lastHookAt;
     return {
       storeFound: !!s || selfAt > 0,
       storeKeys: s ? Object.keys(s).slice(0, 40) : [],
-      store: toList(s && s.quests),
+      store: ours ? [] : toList(s && s.quests),
       storeClaimed: toList(s && s.claimedQuests),
       hookSeen: !!f,
-      hookQuests: toList(f && f.quests),
-      hookExcluded: toList(f && f.excludedQuests),
+      hookQuests: ours ? [] : toList(f && f.quests),
+      hookExcluded: ours ? [] : toList(f && f.excludedQuests),
       hookClaimed: toList(c && (c.claimedQuests || c.quests)),
       selfQuests: selfQuests,
       selfExcluded: selfExcluded,
@@ -930,7 +935,7 @@
     }
     function openQuest(x) {
       var buttons = [];
-      if (LIVE_STATUSES.indexOf(x.status) >= 0 || x.status === 'locked') buttons.push({ text: x.status === 'locked' ? 'Try accept anyway' : 'Accept', onPress: function () { acceptList([x], setMsg); } });
+      if (LIVE_STATUSES.indexOf(x.status) >= 0 || x.status === 'locked') buttons.push({ text: x.status === 'locked' ? 'Try accept anyway' : 'Accept', onPress: function () { if (busyS[0]) { setMsg('Already accepting, please wait.'); return; } busyS[1](true); acceptList([x], setMsg).finally(function () { busyS[1](false); }); } });
       buttons.push({ text: 'Open in Discord', onPress: function () { RN.Linking.openURL('https://discord.com/quests/' + encodeURIComponent(x.id)); } });
       buttons.push({ text: 'Copy JSON', onPress: function () { copyText(safe(x.q), setMsg); } });
       popup(statusIcon(x) + ' ' + (x.known ? x.name : 'Quest ' + x.id), [statusWord(x) + (x.status === 'locked' ? ' (Discord says unknown quest)' : x.status === 'unverified' ? ' (no details yet)' : ''), x.reward ? 'Reward: ' + x.reward : '', x.app ? 'Game: ' + x.app : '', timeLeft(x.expMs), regionLabel(x.id, true), x.hidden ? 'Hidden: ' + hiddenReason(x) : ''].filter(Boolean).join('\n'), buttons);
@@ -988,7 +993,7 @@
           h(Design.TableRow, {
             label: 'Retry refused quests' + (lockedN + goneN ? ' (' + (lockedN + goneN) + ')' : ''),
             subLabel: 'Forget what Discord refused so it is checked again, e.g. after turning a VPN on or off.',
-            onPress: function () { goneMap = {}; lockedMap = {}; probeNextAt = 0; setMsg('Cleared. Refreshing...'); reloadQuests().then(function () { return loadProbe(); }).then(function () { setMsg('Checked again: ' + probeStatus); }, function () { setMsg('Cleared. Pull to refresh the Quests screen.'); }); }
+            onPress: function () { clearRefused('all'); probeNextAt = 0; setMsg('Cleared. Refreshing...'); reloadQuests().then(function () { return loadProbe(); }).then(function () { setMsg('Checked again: ' + probeStatus); }, function () { setMsg('Cleared. Pull to refresh the Quests screen.'); }); }
           }),
           !!lockedN && h(Design.TableRow, { label: 'Why are some refused?', subLabel: 'Discord does not offer them in your region. Tap for what to do.', onPress: vpnHelp })),
 
@@ -1092,7 +1097,7 @@
           ['useFilteredQuests', 'useClaimedQuests'].forEach(function (name) {
             cleanup(V.patcher.instead(mod, name, function (args, orig) {
               var res = Reflect.apply(orig, this, args);
-              lastHook[name] = res;
+              lastHook[name] = res; lastHookAt = Date.now();
               if (name === 'useFilteredQuests') kickIfStale(res);
               if (name === 'useFilteredQuests' && cfgNow().showHidden) {
                 try { return mergeHidden(res); } catch (e) { ctx.plugin.reportError(e); }
@@ -1131,12 +1136,15 @@
       patchHttp();
 
       // new-quest alerts
-      var seenMemo = null;
+      var seenMemo = null, startedAt = Date.now();
       function check() {
         try {
           if (RN.AppState.currentState !== 'active') return;
           var c = cfgNow();
           if (!c.alertNew) return;
+          // the first pass only records what already exists, so wait until our own full list is in
+          // (or two minutes have passed), or every already-hidden quest would be announced as new
+          if (!c.seeded && !selfAt && Date.now() - startedAt < 120000) return;
           var quests = unify(collect());
           if (quests.length === 0) return;
           if (!seenMemo) seenMemo = new Set(c.seen);
@@ -1180,8 +1188,8 @@
         var cs = cfgNow();
         if (isObj(cs.regions) && Object.keys(cs.regions).length) setRegions(cs.regions, Number(cs.regionsAt) || 0);
         if (isObj(cs.meta) && Object.keys(cs.meta).length) setMeta(cs.meta, Number(cs.metaAt) || 0);
-        if (isObj(cs.gone)) Object.keys(cs.gone).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.gone[k] === 'number') goneMap[k] = cs.gone[k]; });
-        if (isObj(cs.locked)) Object.keys(cs.locked).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.locked[k] === 'number') lockedMap[k] = cs.locked[k]; });
+        if (isObj(cs.gone)) Object.keys(cs.gone).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.gone[k] === 'number' && cs.gone[k] > (Number(cs.goneClearedAt) || 0)) goneMap[k] = cs.gone[k]; });
+        if (isObj(cs.locked)) Object.keys(cs.locked).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.locked[k] === 'number' && cs.locked[k] > (Number(cs.lockedClearedAt) || 0)) lockedMap[k] = cs.locked[k]; });
         if (isObj(cs.learned)) Object.keys(cs.learned).forEach(function (k) { var r = cs.learned[k]; if (/^\d{5,25}$/.test(k) && isObj(r) && Array.isArray(r.y) && Array.isArray(r.n)) learnedMap[k] = { y: codeList(r.y), n: codeList(r.n) }; });
         loadRegions(false);
         if (cs.detectIp) detectCountry(true);
