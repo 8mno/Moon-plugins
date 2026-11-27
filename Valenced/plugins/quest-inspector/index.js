@@ -270,7 +270,7 @@
   // a VPN was switched on or off: what Discord refused before may be offered now
   function onCountryChanged(prev, cc) {
     lockedMap = {}; probeNextAt = 0;
-    toast('QI_COUNTRY', 'Your country is now ' + flag(cc) + ' ' + cc + '. Checking quests again...', false, 'globe');
+    toast('QI_COUNTRY', 'Your country is now ' + flag(cc, true) + '. Checking quests again...', false, 'globe');
     var m = enrollModule();
     if (m) { try { Promise.resolve(m.fetchCurrentQuests()).catch(function () {}); } catch (e) {} }
   }
@@ -428,16 +428,54 @@
   function own(o, k) { return Object.prototype.hasOwnProperty.call(o, k) ? o[k] : null; }
   function regionFor(id) { return own(regionMap, id) || own(replacedBy, id) || null; }
   function regionKind(id) { var r = regionFor(id); return !r ? 'unknown' : r.g ? 'global' : 'regional'; }
-  function flag(code, withCode) {
+  // Country names (ISO 3166). Quest region lists only carry two-letter codes.
+  var COUNTRY_NAMES = null;
+  function cname(code) {
+    var c = String(code).toUpperCase();
+    if (c === 'UK') c = 'GB';
+    if (!COUNTRY_NAMES) {
+      COUNTRY_NAMES = {};
+      'AD:Andorra|AE:United Arab Emirates|AF:Afghanistan|AG:Antigua and Barbuda|AI:Anguilla|AL:Albania|AM:Armenia|AO:Angola|AQ:Antarctica|AR:Argentina|AS:American Samoa|AT:Austria|AU:Australia|AW:Aruba|AX:Åland Islands|AZ:Azerbaijan|BA:Bosnia and Herzegovina|BB:Barbados|BD:Bangladesh|BE:Belgium|BF:Burkina Faso|BG:Bulgaria|BH:Bahrain|BI:Burundi|BJ:Benin|BL:Saint Barthélemy|BM:Bermuda|BN:Brunei|BO:Bolivia|BQ:Caribbean Netherlands|BR:Brazil|BS:Bahamas|BT:Bhutan|BW:Botswana|BY:Belarus|BZ:Belize|CA:Canada|CC:Cocos Islands|CD:DR Congo|CF:Central African Republic|CG:Republic of the Congo|CH:Switzerland|CI:Côte d\'Ivoire|CK:Cook Islands|CL:Chile|CM:Cameroon|CN:China|CO:Colombia|CR:Costa Rica|CU:Cuba|CV:Cape Verde|CW:Curaçao|CX:Christmas Island|CY:Cyprus|CZ:Czechia|DE:Germany|DJ:Djibouti|DK:Denmark|DM:Dominica|DO:Dominican Republic|DZ:Algeria|EC:Ecuador|EE:Estonia|EG:Egypt|EH:Western Sahara|ER:Eritrea|ES:Spain|ET:Ethiopia|FI:Finland|FJ:Fiji|FK:Falkland Islands|FM:Micronesia|FO:Faroe Islands|FR:France|GA:Gabon|GB:United Kingdom|GD:Grenada|GE:Georgia|GF:French Guiana|GG:Guernsey|GH:Ghana|GI:Gibraltar|GL:Greenland|GM:Gambia|GN:Guinea|GP:Guadeloupe|GQ:Equatorial Guinea|GR:Greece|GT:Guatemala|GU:Guam|GW:Guinea-Bissau|GY:Guyana|HK:Hong Kong|HN:Honduras|HR:Croatia|HT:Haiti|HU:Hungary|ID:Indonesia|IE:Ireland|IL:Israel|IM:Isle of Man|IN:India|IO:British Indian Ocean Territory|IQ:Iraq|IR:Iran|IS:Iceland|IT:Italy|JE:Jersey|JM:Jamaica|JO:Jordan|JP:Japan|KE:Kenya|KG:Kyrgyzstan|KH:Cambodia|KI:Kiribati|KM:Comoros|KN:Saint Kitts and Nevis|KP:North Korea|KR:South Korea|KW:Kuwait|KY:Cayman Islands|KZ:Kazakhstan|LA:Laos|LB:Lebanon|LC:Saint Lucia|LI:Liechtenstein|LK:Sri Lanka|LR:Liberia|LS:Lesotho|LT:Lithuania|LU:Luxembourg|LV:Latvia|LY:Libya|MA:Morocco|MC:Monaco|MD:Moldova|ME:Montenegro|MF:Saint Martin|MG:Madagascar|MH:Marshall Islands|MK:North Macedonia|ML:Mali|MM:Myanmar|MN:Mongolia|MO:Macao|MP:Northern Mariana Islands|MQ:Martinique|MR:Mauritania|MS:Montserrat|MT:Malta|MU:Mauritius|MV:Maldives|MW:Malawi|MX:Mexico|MY:Malaysia|MZ:Mozambique|NA:Namibia|NC:New Caledonia|NE:Niger|NF:Norfolk Island|NG:Nigeria|NI:Nicaragua|NL:Netherlands|NO:Norway|NP:Nepal|NR:Nauru|NU:Niue|NZ:New Zealand|OM:Oman|PA:Panama|PE:Peru|PF:French Polynesia|PG:Papua New Guinea|PH:Philippines|PK:Pakistan|PL:Poland|PM:Saint Pierre and Miquelon|PN:Pitcairn Islands|PR:Puerto Rico|PS:Palestine|PT:Portugal|PW:Palau|PY:Paraguay|QA:Qatar|RE:Réunion|RO:Romania|RS:Serbia|RU:Russia|RW:Rwanda|SA:Saudi Arabia|SB:Solomon Islands|SC:Seychelles|SD:Sudan|SE:Sweden|SG:Singapore|SH:Saint Helena|SI:Slovenia|SJ:Svalbard and Jan Mayen|SK:Slovakia|SL:Sierra Leone|SM:San Marino|SN:Senegal|SO:Somalia|SR:Suriname|SS:South Sudan|ST:São Tomé and Príncipe|SV:El Salvador|SX:Sint Maarten|SY:Syria|SZ:Eswatini|TC:Turks and Caicos Islands|TD:Chad|TG:Togo|TH:Thailand|TJ:Tajikistan|TK:Tokelau|TL:Timor-Leste|TM:Turkmenistan|TN:Tunisia|TO:Tonga|TR:Türkiye|TT:Trinidad and Tobago|TV:Tuvalu|TW:Taiwan|TZ:Tanzania|UA:Ukraine|UG:Uganda|US:United States|UY:Uruguay|UZ:Uzbekistan|VA:Vatican City|VC:Saint Vincent and the Grenadines|VE:Venezuela|VG:British Virgin Islands|VI:U.S. Virgin Islands|VN:Vietnam|VU:Vanuatu|WF:Wallis and Futuna|WS:Samoa|XK:Kosovo|YE:Yemen|YT:Mayotte|ZA:South Africa|ZM:Zambia|ZW:Zimbabwe'.split('|').forEach(function (e) { COUNTRY_NAMES[e.slice(0, 2)] = e.slice(3); });
+    }
+    return Object.prototype.hasOwnProperty.call(COUNTRY_NAMES, c) ? COUNTRY_NAMES[c] : c;
+  }
+  function flag(code, withName) {
     var c = String(code).toUpperCase();
     if (c === 'UK') c = 'GB';
     if (!/^[A-Z]{2}$/.test(c)) return String(code);
     var f = String.fromCodePoint(0x1F1E6 + c.charCodeAt(0) - 65, 0x1F1E6 + c.charCodeAt(1) - 65);
-    return withCode ? f + ' ' + c : f;
+    return withName ? f + ' ' + cname(c) : f;
   }
-  function flags(list, max, withCode) {
-    var s = list.slice(0, max).map(function (c) { return flag(c, withCode); }).join(withCode ? ', ' : ' ');
+  function flags(list, max, withName) {
+    var s = list.slice(0, max).map(function (c) { return flag(c, withName); }).join(withName ? ', ' : ' ');
     return list.length > max ? s + ' +' + (list.length - max) : s;
+  }
+  // A weak hint for quests missing from the region list: the language of the quest's own text.
+  // Only scripts and letters that point at very few countries are used, and it is always shown as a guess.
+  var LANG_RULES = [
+    { re: /[\u3040-\u30FF]/, lang: 'Japanese', codes: ['JP'] },
+    { re: /[\uAC00-\uD7AF\u1100-\u11FF]/, lang: 'Korean', codes: ['KR'] },
+    { re: /[\u0E00-\u0E7F]/, lang: 'Thai', codes: ['TH'] },
+    { re: /[\u0590-\u05FF]/, lang: 'Hebrew', codes: ['IL'] },
+    { re: /[\u0900-\u097F]/, lang: 'Hindi', codes: ['IN'] },
+    { re: /[\u0370-\u03FF]/, lang: 'Greek', codes: ['GR', 'CY'] },
+    { re: /[\u0600-\u06FF]/, lang: 'Arabic', codes: [] },
+    { re: /[\u0400-\u04FF]/, lang: 'Russian or Cyrillic', codes: ['RU', 'UA', 'KZ'] },
+    { re: /[\u4E00-\u9FFF]/, lang: 'Chinese', codes: ['CN', 'TW', 'HK'] },
+    { re: /[\u01A1\u01B0\u0111\u1EA0-\u1EF9]/i, lang: 'Vietnamese', codes: ['VN'] },
+    { re: /[\u011F\u015F\u0131\u0130]/, lang: 'Turkish', codes: ['TR'] },
+    { re: /[\u0105\u0119\u0142\u015B\u017A\u017C]/i, lang: 'Polish', codes: ['PL'] },
+    { re: /[\u011B\u0159\u016F]/i, lang: 'Czech', codes: ['CZ'] },
+    { re: /[\u0151\u0171]/i, lang: 'Hungarian', codes: ['HU'] },
+    { re: /\u00DF/, lang: 'German', codes: ['DE', 'AT', 'CH'] },
+    { re: /[\u00E3\u00F5]/i, lang: 'Portuguese', codes: ['BR', 'PT'] },
+    { re: /[\u00F1\u00BF\u00A1]/i, lang: 'Spanish', codes: ['ES', 'MX'] }
+  ];
+  var langMap = {};            // quest id -> { lang, codes }
+  function guessLanguage(text) {
+    if (!text) return null;
+    for (var i = 0; i < LANG_RULES.length; i++) if (LANG_RULES[i].re.test(text)) return { lang: LANG_RULES[i].lang, codes: LANG_RULES[i].codes };
+    return null;
   }
   // Which country Discord thinks you are in is not exposed anywhere, but it can be worked out: every
   // regional quest Discord really shows you (not hidden, still available) must allow your country.
@@ -481,13 +519,15 @@
       if (L && L.y.length) seen.push('works from ' + flags(L.y, 4));
       if (L && L.n.length) seen.push('refused from ' + flags(L.n, 4));
       if (seen.length) return '\uD83D\uDD0D ' + seen.join(' \u00b7 ');
+      var lg = own(langMap, id);
+      if (lg) return '\uD83D\uDD0E text is ' + lg.lang + (lg.codes.length ? ', so maybe ' + flags(lg.codes, 3, long || lg.codes.length === 1) : '') + ' (a guess)';
       return regionsAt ? '\u2754 region unknown (not in the list yet)' : '';
     }
     var age = r.a ? ' \uD83D\uDD1E' : '';
     if (r.g) return '\uD83C\uDF10 global' + age;
     var parts = [];
-    if (r.i.length) parts.push('only ' + flags(r.i, long ? 99 : 6, long));
-    if (r.e.length) parts.push('not ' + flags(r.e, long ? 99 : 6, long));
+    if (r.i.length) parts.push('only ' + flags(r.i, long ? 99 : 6, long || r.i.length <= 2));
+    if (r.e.length) parts.push('not ' + flags(r.e, long ? 99 : 6, long || r.e.length <= 2));
     if (!parts.length) parts.push('\uD83D\uDD12 region-limited');
     var a = access(id);
     return parts.join(' \u00b7 ') + (a === 'yes' ? ' \u00b7 \u2705 your region' : a === 'no' ? ' \u00b7 \uD83D\uDEAB not your region' : '') + age;
@@ -498,7 +538,7 @@
   }
   function hiddenReason(x) {
     var why = [];
-    if (regionKind(x.id) === 'regional') why.push(access(x.id) === 'no' ? 'not offered in ' + flags(userRegion.codes, 3) : 'region-limited');
+    if (regionKind(x.id) === 'regional') why.push(access(x.id) === 'no' ? 'not offered in ' + flags(userRegion.codes, 3, true) : 'region-limited');
     if (x.types.length && x.types.every(function (t) { return DESKTOP_ONLY.indexOf(t) >= 0; })) why.push('needs desktop/console');
     return why.length ? 'likely ' + why.join(' + ') : 'reason unknown';
   }
@@ -557,6 +597,10 @@
       if (n) out.progress = Math.round(sum / n * 100);
     }
     out.app = isObj(cfg.application) && typeof cfg.application.name === 'string' ? cfg.application.name : '';
+    var txt = out.app;
+    if (isObj(cfg.messages)) Object.keys(cfg.messages).forEach(function (k) { if (typeof cfg.messages[k] === 'string') txt += ' ' + cfg.messages[k]; });
+    var lg = guessLanguage(txt);
+    if (lg && out.id) langMap[out.id] = lg;
     out.status = (us.claimedAt || us.claimed_at) ? 'claimed'
       : (us.completedAt || us.completed_at) ? 'completed'
       : (Number.isFinite(out.expMs) && out.expMs <= Date.now()) ? 'expired'
@@ -861,7 +905,7 @@
     }
     var next;
     if (!d.storeFound) next = { label: 'Open Discord’s Quests screen once', sub: 'The plugin needs it to load before it can list anything.' };
-    else if (lockedN && !liveHidden.length) next = { label: lockedN + ' quest' + (lockedN === 1 ? '' : 's') + ' not offered in your region', sub: (vpnTop.length ? 'Best VPN country: ' + vpnTop.map(function (k) { return flag(k) + ' ' + ccLocked.counts[k]; }).join('  ') + '. ' : '') + 'Tap for the steps.', press: vpnHelp };
+    else if (lockedN && !liveHidden.length) next = { label: lockedN + ' quest' + (lockedN === 1 ? '' : 's') + ' not offered in your region', sub: (vpnTop.length ? 'Best VPN country: ' + vpnTop.map(function (k) { return flag(k, true) + ' (' + ccLocked.counts[k] + ')'; }).join(', ') + '. ' : '') + 'Tap for the steps.', press: vpnHelp };
     else if (liveHidden.length) next = { label: liveHidden.length + ' hidden quest' + (liveHidden.length === 1 ? ' is' : 's are') + ' ready to accept', sub: 'Tap to accept them all.', press: function () { confirmAccept(liveHidden, 'Accept ' + liveHidden.length + ' hidden quests?'); } };
     else next = { label: 'Nothing hidden is live right now', sub: 'You will get an alert when a new quest appears.' };
     var q = qS[0];
@@ -909,14 +953,14 @@
         h(TI, { value: q, placeholder: 'Search name, reward, game, type, country code', size: 'md', onChange: onText, onChangeText: onText }),
         h(Design.TableRowGroup, { title: 'Quests (' + view.length + ' of ' + all.length + ')' },
           h(Design.TableRow, (function () {
-            if (userRegion.from === 'ip') return { label: 'Your country: ' + flag(ipCountry.cc) + ' ' + ipCountry.cc, subLabel: 'From your IP, so it follows a VPN. ' + (userRegion.guess.length && userRegion.guess.indexOf(ipCountry.cc) < 0 ? 'The quests Discord shows you point to ' + flags(userRegion.guess, 3) + ', so Discord may see you elsewhere. ' : '') + 'Tap to check again.', onPress: function () { setMsg('Checking your country...'); detectCountry(true).then(function () { setMsg(ipCountry.cc ? 'You are in ' + ipCountry.cc + '.' : 'Country check ' + ipCountry.status); }); } };
-            if (userRegion.codes.length) return { label: 'Your region: ' + flags(userRegion.codes, 4) + ' (' + userRegion.codes.join(', ') + ')', subLabel: 'Guessed from the ' + userRegion.n + ' region-limited quests Discord shows you. Tap to try your IP instead.', onPress: function () { detectCountry(true).then(function () { setMsg(ipCountry.cc ? 'You are in ' + ipCountry.cc + '.' : 'Country check ' + ipCountry.status); }); } };
+            if (userRegion.from === 'ip') return { label: 'Your country: ' + flag(ipCountry.cc, true) + ' (' + ipCountry.cc + ')', subLabel: 'From your IP, so it follows a VPN. ' + (userRegion.guess.length && userRegion.guess.indexOf(ipCountry.cc) < 0 ? 'The quests Discord shows you point to ' + flags(userRegion.guess, 3) + ', so Discord may see you elsewhere. ' : '') + 'Tap to check again.', onPress: function () { setMsg('Checking your country...'); detectCountry(true).then(function () { setMsg(ipCountry.cc ? 'You are in ' + ipCountry.cc + '.' : 'Country check ' + ipCountry.status); }); } };
+            if (userRegion.codes.length) return { label: 'Your region: ' + flags(userRegion.codes, 4, true), subLabel: 'Guessed from the ' + userRegion.n + ' region-limited quests Discord shows you. Tap to try your IP instead.', onPress: function () { detectCountry(true).then(function () { setMsg(ipCountry.cc ? 'You are in ' + ipCountry.cc + '.' : 'Country check ' + ipCountry.status); }); } };
             return { label: 'Your country: not known yet', subLabel: (c.detectIp ? 'IP check ' + ipCountry.status + '. ' : 'IP check is off in Options. ') + 'Tap to try.', onPress: function () { detectCountry(true).then(function () { setMsg(ipCountry.cc ? 'You are in ' + ipCountry.cc + '.' : 'Country check ' + ipCountry.status); }); } };
           })()),
           h(Design.TableRow, { label: 'Show: ' + c.filter + ' (' + view.length + ')', subLabel: 'Tap to change. Next: ' + cycle(FILTERS, c.filter) + '. All options: ' + FILTERS.join(', ') + '.', onPress: function () { set({ filter: cycle(FILTERS, c.filter) }); } }),
           h(Design.TableRow, { label: 'Region: ' + c.region, subLabel: 'Tap to change: ' + REGION_FILTERS.join(' / ') + '. You can also search a country code like US or IQ.', onPress: function () { set({ region: cycle(REGION_FILTERS, c.region) }); } }),
           cc.top.length > 0 && h(Design.TableRow, {
-            label: 'Unlock by country: ' + cc.top.slice(0, 4).map(function (code) { return flag(code) + ' ' + cc.counts[code]; }).join('  '),
+            label: 'Unlock by country: ' + cc.top.slice(0, 3).map(function (code) { return flag(code, true) + ' (' + cc.counts[code] + ')'; }).join(', '),
             subLabel: 'Live hidden quests each country would show you. Tap for the full list.',
             onPress: showCountries
           }),
@@ -933,7 +977,7 @@
               })),
 
         h(Design.TableRowGroup, { title: 'VPN apps' },
-          h(Design.TableRow, { label: vpnTop.length ? 'Best country now: ' + vpnTop.map(function (k) { return flag(k) + ' ' + k; }).join('  ') : 'Pick a country that unlocks the most quests', subLabel: 'Switch the VPN to it, and the plugin notices and re-checks by itself.', onPress: vpnHelp }),
+          h(Design.TableRow, { label: vpnTop.length ? 'Best country now: ' + vpnTop.map(function (k) { return flag(k, true); }).join(', ') : 'Pick a country that unlocks the most quests', subLabel: 'Switch the VPN to it, and the plugin notices and re-checks by itself.', onPress: vpnHelp }),
           VPN_OK.map(function (v) { return h(Design.TableRow, { key: v.name, label: v.name, subLabel: v.url.replace(/^https:\/\//, ''), onPress: function () { RN.Linking.openURL(v.url).catch(function () { setMsg('Could not open ' + v.url); }); } }); }),
           VPN_OK.length === 0 && h(Design.TableRow, { label: 'No VPN links yet', subLabel: 'Add them in the VPN_LINKS list at the top of the plugin code.' })),
 
