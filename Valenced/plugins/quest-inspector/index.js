@@ -201,7 +201,7 @@
   }
   async function fetchMeta(force) {
     var want = new Set(stubIds());
-    if (want.size === 0) { metaStatus = 'nothing to look up yet (open the Quests screen once)'; return false; }
+    if (want.size === 0) { metaStatus = 'nothing to look up yet (quests not loaded yet)'; return false; }
     metaStatus = 'downloading...';
     var found = {}, errs = [];
     for (var i = 0; i < META_URLS.length; i++) {
@@ -271,8 +271,7 @@
   function onCountryChanged(prev, cc) {
     lockedMap = {}; probeNextAt = 0;
     toast('QI_COUNTRY', 'Your country is now ' + flag(cc, true) + '. Checking quests again...', false, 'globe');
-    var m = enrollModule();
-    if (m) { try { Promise.resolve(m.fetchCurrentQuests()).catch(function () {}); } catch (e) {} }
+    reloadQuests();
   }
   // what the server itself told us about a quest from a given country, kept so unknown regions fill in over time
   var learnedMap = {};
@@ -615,12 +614,51 @@
     return out;
   }
 
+  // ---------- load the quest list ourselves, so the Quests screen never has to be opened ----------
+  // GET /quests/@me is the request Discord's own Quests screen makes. Its answer has the visible quests and
+  // `excluded_quests` (the hidden stubs), so the plugin can list everything on its own.
+  var SELF_TTL = 10 * 60 * 1000;
+  var selfQuests = [], selfExcluded = [], selfAt = 0, selfTried = 0, selfStatus = 'not loaded yet', selfLoading = null;
+  function fetchSelf(force) {
+    if (selfLoading) return selfLoading;
+    if (!force && selfAt && Date.now() - selfAt < SELF_TTL) return Promise.resolve(false);
+    if (!force && Date.now() - selfTried < 20000) return Promise.resolve(false);
+    selfLoading = doFetchSelf().then(function (r) { selfLoading = null; return r; }, function () { selfLoading = null; return false; });
+    return selfLoading;
+  }
+  async function doFetchSelf() {
+    selfTried = Date.now();
+    var http = httpModule();
+    if (!http || typeof http.get !== 'function') { selfStatus = 'Discord HTTP client not ready yet'; return false; }
+    try {
+      var res = await http.get({ url: '/quests/@me', retries: 0 });
+      var body = isObj(res) && isObj(res.body) ? res.body : res;
+      var q = isObj(body) && Array.isArray(body.quests) ? body.quests : null;
+      var x = isObj(body) && (Array.isArray(body.excluded_quests) ? body.excluded_quests : Array.isArray(body.excludedQuests) ? body.excludedQuests : null);
+      if (!q) throw new Error('reply had no quests list');
+      selfQuests = camelize(q).filter(function (e) { return isObj(e) && typeof e.id === 'string'; });
+      selfExcluded = camelize(x || []).filter(function (e) { return isObj(e) && typeof e.id === 'string'; });
+      selfAt = Date.now();
+      selfStatus = selfQuests.length + ' quests + ' + selfExcluded.length + ' hidden, loaded by the plugin';
+      return true;
+    } catch (e) {
+      selfStatus = 'failed: ' + errText(e);
+      return false;
+    }
+  }
+  // reload both our own copy and Discord's store
+  function reloadQuests() {
+    var m = enrollModule();
+    var native = m ? Promise.resolve().then(function () { return m.fetchCurrentQuests(); }).catch(function () {}) : Promise.resolve();
+    return Promise.all([fetchSelf(true), native]);
+  }
+
   function collect() {
     var s = getStore();
     var f = lastHook.useFilteredQuests;
     var c = lastHook.useClaimedQuests;
     return {
-      storeFound: !!s,
+      storeFound: !!s || selfAt > 0,
       storeKeys: s ? Object.keys(s).slice(0, 40) : [],
       store: toList(s && s.quests),
       storeClaimed: toList(s && s.claimedQuests),
@@ -628,6 +666,8 @@
       hookQuests: toList(f && f.quests),
       hookExcluded: toList(f && f.excludedQuests),
       hookClaimed: toList(c && (c.claimedQuests || c.quests)),
+      selfQuests: selfQuests,
+      selfExcluded: selfExcluded,
       hookKeys: isObj(f) ? Object.keys(f) : []
     };
   }
@@ -645,6 +685,7 @@
     }
     add(d.store, 'store'); add(d.hookQuests, 'shown'); add(d.hookExcluded, 'excluded');
     add(d.storeClaimed, 'claimed'); add(d.hookClaimed, 'claimed');
+    add(d.selfQuests, 'shown'); add(d.selfExcluded, 'excluded');
     var infos = Array.from(map.values()).map(function (e) {
       var info = describe(e.q);
       info.q = e.q;
@@ -719,7 +760,7 @@
   // The server's reply carries enrolled_at, and that is the only thing counted as success.
   async function enrollOne(x) {
     var http = httpModule();
-    if (!http) throw new Error('Discord\u2019s HTTP client was not found. Open the Quests screen once and retry.');
+    if (!http) throw new Error('Discord\u2019s HTTP client was not found. Try again in a moment.');
     var res;
     viaPlugin++;
     try { res = await http.post({ url: '/quests/' + encodeURIComponent(x.id) + '/enroll', body: { location: QUEST_HOME_MOBILE }, retries: 0 }); }
@@ -741,8 +782,7 @@
       }
       if (i < list.length - 1) await sleep(delay);
     }
-    var m = enrollModule();
-    if (m) { try { await m.fetchCurrentQuests(); } catch (e) {} }
+    await reloadQuests();
     setMsg('Server confirmed ' + ok + '/' + list.length + (fail.length ? '. Failed: ' + fail.join('; ') : '.'));
     toast('QI_ACCEPT', ok + '/' + list.length + ' quests enrolled', ok === 0 && list.length > 0, ok === 0 && list.length > 0 ? 'bad' : 'ok');
     try {
@@ -904,14 +944,14 @@
         '1. Turn on a VPN app set to the country with the most quests (a split-tunnel for Discord is enough).\n2. Come back here and tap “Retry refused quests”.\n3. Tap “Accept all live hidden”.\n\nThe VPN can be turned off again after accepting.');
     }
     var next;
-    if (!d.storeFound) next = { label: 'Open Discord’s Quests screen once', sub: 'The plugin needs it to load before it can list anything.' };
+    if (!d.storeFound) next = { label: 'Loading quests...', sub: selfStatus + '. Tap to try again.', press: function () { setMsg('Loading...'); reloadQuests().then(function () { setMsg(selfAt ? 'Loaded.' : 'Not loaded: ' + selfStatus); }); } };
     else if (lockedN && !liveHidden.length) next = { label: lockedN + ' quest' + (lockedN === 1 ? '' : 's') + ' not offered in your region', sub: (vpnTop.length ? 'Best VPN country: ' + vpnTop.map(function (k) { return flag(k, true) + ' (' + ccLocked.counts[k] + ')'; }).join(', ') + '. ' : '') + 'Tap for the steps.', press: vpnHelp };
     else if (liveHidden.length) next = { label: liveHidden.length + ' hidden quest' + (liveHidden.length === 1 ? ' is' : 's are') + ' ready to accept', sub: 'Tap to accept them all.', press: function () { confirmAccept(liveHidden, 'Accept ' + liveHidden.length + ' hidden quests?'); } };
     else next = { label: 'Nothing hidden is live right now', sub: 'You will get an alert when a new quest appears.' };
     var q = qS[0];
     var active = all.filter(function (x) { return x.status === 'enrolled'; }).sort(function (a, b) { return (Number.isFinite(a.expMs) ? a.expMs : Infinity) - (Number.isFinite(b.expMs) ? b.expMs : Infinity); });
     function howTo() {
-      popup('How to use Quest Inspector', '1. Open Discord\u2019s Quests screen once so the quests load.\n2. The top row tells you the next step. Tap \u201cAccept all live hidden\u201d to accept every hidden quest that is live.\n3. If Discord refuses quests for your region, turn on a VPN in the country shown under \u201cVPN apps\u201d. The plugin notices the new country and checks again.\n4. Accepted quests show their progress at the top, and you get a reminder before they expire.');
+      popup('How to use Quest Inspector', '1. The plugin loads your quests by itself.\n2. The top row tells you the next step. Tap \u201cAccept all live hidden\u201d to accept every hidden quest that is live.\n3. If Discord refuses quests for your region, turn on a VPN in the country shown under \u201cVPN apps\u201d. The plugin notices the new country and checks again.\n4. Accepted quests show their progress at the top, and you get a reminder before they expire.');
     }
 
     return h(RN.ScrollView, { style: { flex: 1 }, contentContainerStyle: { paddingBottom: 24 } },
@@ -945,7 +985,7 @@
           h(Design.TableRow, {
             label: 'Retry refused quests' + (lockedN + goneN ? ' (' + (lockedN + goneN) + ')' : ''),
             subLabel: 'Forget what Discord refused so it is checked again, e.g. after turning a VPN on or off.',
-            onPress: function () { goneMap = {}; lockedMap = {}; probeNextAt = 0; setMsg('Cleared. Refreshing...'); var m = enrollModule(); Promise.resolve(m && m.fetchCurrentQuests()).then(function () { return loadProbe(); }).then(function () { setMsg('Checked again: ' + probeStatus); }, function () { setMsg('Cleared. Pull to refresh the Quests screen.'); }); }
+            onPress: function () { goneMap = {}; lockedMap = {}; probeNextAt = 0; setMsg('Cleared. Refreshing...'); reloadQuests().then(function () { return loadProbe(); }).then(function () { setMsg('Checked again: ' + probeStatus); }, function () { setMsg('Cleared. Pull to refresh the Quests screen.'); }); }
           }),
           !!lockedN && h(Design.TableRow, { label: 'Why are some refused?', subLabel: 'Discord does not offer them in your region. Tap for what to do.', onPress: vpnHelp })),
 
@@ -1007,14 +1047,11 @@
             };
           })()),
           !!skippedHidden && h(Design.TableRow, { label: skippedHidden + ' hidden quest(s) not added to Discord’s list', subLabel: 'No details for them yet, so Discord’s quest card could not draw them.' }),
-          (!d.storeFound || !hasHttp) && h(Design.TableRow, { label: (d.storeFound ? '' : 'Quest store NOT found. ') + (hasHttp ? '' : 'Discord HTTP client NOT found.'), subLabel: 'Open Discord’s Quests screen once, then come back.' }),
+          !hasHttp && h(Design.TableRow, { label: 'Discord HTTP client NOT found', subLabel: 'Needed to load and accept quests. Reload the app and try again.' }),
           h(Design.TableRow, {
             label: 'Refresh quests from Discord',
-            onPress: function () {
-              var m = enrollModule();
-              if (!m) { setMsg('fetchCurrentQuests not found.'); return; }
-              Promise.resolve(m.fetchCurrentQuests()).then(function () { setMsg('Refreshed.'); }, function () { setMsg('Refresh failed.'); });
-            }
+            subLabel: 'Quest list: ' + selfStatus + (selfAt ? ' (' + Math.max(0, Math.round((Date.now() - selfAt) / 60000)) + ' min ago)' : ''),
+            onPress: function () { setMsg('Reloading...'); reloadQuests().then(function () { setMsg(selfAt ? 'Reloaded: ' + selfStatus : 'Reload ' + selfStatus); }); }
           }),
           h(Design.TableRow, { label: 'Copy everything as JSON', subLabel: 'Raw quests plus store/hook keys, for bug reports.', onPress: function () { copyText(safe(d), setMsg); } }))));
   }
@@ -1126,7 +1163,8 @@
         if (isObj(cs.learned)) Object.keys(cs.learned).forEach(function (k) { var r = cs.learned[k]; if (/^\d{5,25}$/.test(k) && isObj(r) && Array.isArray(r.y) && Array.isArray(r.n)) learnedMap[k] = { y: codeList(r.y), n: codeList(r.n) }; });
         loadRegions(false);
         if (cs.detectIp) detectCountry(true);
-        timer = setInterval(function () { patchHttp(); if (RN.AppState.currentState === 'active') { if (cfgNow().detectIp) detectCountry(false); maybeMeta(); maybeProbe(); remind(); } check(); }, 8000);
+        fetchSelf(true);
+        timer = setInterval(function () { patchHttp(); if (RN.AppState.currentState === 'active') { if (cfgNow().detectIp) detectCountry(false); fetchSelf(false); maybeMeta(); maybeProbe(); remind(); } check(); }, 8000);
         check();
       });
       cleanup(function () { if (timer) clearInterval(timer); });
