@@ -65,7 +65,7 @@
   var PROBE_MAX_AGE_DAYS = 60;             // older ids are not worth asking about
   var PROBE_GONE_TTL = 24 * 3600 * 1000;   // how long "expired" is remembered
   var LOCKED_TTL = 30 * 60 * 1000;         // how long "not offered to you" is remembered (short, so a new VPN gets a fresh try)
-  var PROBE_GAP = 500;                     // ms between requests
+  var PROBE_GAP = 1000;                    // ms between requests
   var QUEST_HOME_MOBILE = 12;   // "location" Discord's accept request needs (QUEST_HOME_MOBILE)
   var DESKTOP_ONLY = ['PLAY_ON_DESKTOP', 'PLAY_ON_XBOX', 'PLAY_ON_PLAYSTATION', 'STREAM_ON_DESKTOP'];
   var TYPE_LABELS = {
@@ -269,9 +269,9 @@
   }
   // a VPN was switched on or off: what Discord refused before may be offered now
   function onCountryChanged(prev, cc) {
-    lockedMap = {}; probeNextAt = 0;
+    lockedMap = {}; probeNextAt = Date.now() + 30000;   // give the new connection a moment before asking Discord again
     toast('QI_COUNTRY', 'Your country is now ' + flag(cc, true) + '. Checking quests again...', false, 'globe');
-    reloadQuests();
+    setTimeout(function () { reloadQuests(); }, 4000);
   }
   // what the server itself told us about a quest from a given country, kept so unknown regions fill in over time
   var learnedMap = {};
@@ -341,7 +341,7 @@
         else if (kind === 'locked') { locked[batch[i]] = Date.now(); n.locked++; learn(batch[i], false); }
         else {
           n.err++; lastErr = errText(e);
-          if (isObj(e) && e.status === 429) break;
+          if (rateLimited(e)) break;
         }
       }
       if (i < batch.length - 1) await sleep(PROBE_GAP);
@@ -355,7 +355,7 @@
     return n.ok + n.gone + n.locked > 0;
   }
   function maybeProbe() {
-    if (probing || metaLoading || Date.now() < probeNextAt || !cfgNow().autoProbe) return;
+    if (probing || metaLoading || Date.now() < probeNextAt || Date.now() < backoffUntil || !cfgNow().autoProbe) return;
     if (probeCandidates().length === 0) return;
     probeNextAt = Date.now() + META_RETRY_FAIL;
     loadProbe();
@@ -618,11 +618,14 @@
   // GET /quests/@me is the request Discord's own Quests screen makes. Its answer has the visible quests and
   // `excluded_quests` (the hidden stubs), so the plugin can list everything on its own.
   var SELF_TTL = 10 * 60 * 1000;
+  var backoffUntil = 0;   // after Discord answers 429 (too many requests) the plugin stops asking for a while
+  function rateLimited(e) { if (isObj(e) && e.status === 429) { backoffUntil = Date.now() + 10 * 60000; return true; } return false; }
   var selfQuests = [], selfExcluded = [], selfAt = 0, selfTried = 0, selfStatus = 'not loaded yet', selfLoading = null;
   function fetchSelf(force) {
     if (selfLoading) return selfLoading;
     if (!force && selfAt && Date.now() - selfAt < SELF_TTL) return Promise.resolve(false);
     if (!force && Date.now() - selfTried < 20000) return Promise.resolve(false);
+    if (Date.now() < backoffUntil) return Promise.resolve(false);
     selfLoading = doFetchSelf().then(function (r) { selfLoading = null; return r; }, function () { selfLoading = null; return false; });
     return selfLoading;
   }
@@ -642,7 +645,7 @@
       selfStatus = selfQuests.length + ' quests + ' + selfExcluded.length + ' hidden, loaded by the plugin';
       return true;
     } catch (e) {
-      selfStatus = 'failed: ' + errText(e);
+      selfStatus = rateLimited(e) ? 'Discord asked us to slow down, trying again in 10 min' : 'failed: ' + errText(e);
       return false;
     }
   }
@@ -1046,6 +1049,12 @@
               onPress: function () { copyText(JSON.stringify(enrollLog.map(function (z) { return { id: z.id, ok: z.ok, by: z.src, reply: z.text, sent: z.sent, secondsAgo: Math.round((Date.now() - z.at) / 1000) }; }), null, 2), setMsg); }
             };
           })()),
+          h(Design.TableRow, (function () {
+            var f = lastHook.useFilteredQuests;
+            if (!f) return { label: 'Discord\u2019s own Quests screen: not opened since start', subLabel: 'The plugin does not need it. This only matters for the \u201cshow hidden quests there\u201d option.' };
+            var shown = Array.isArray(f.quests) ? f.quests.length : 0, hid = Array.isArray(f.excludedQuests) ? f.excludedQuests.length : 0;
+            return { label: 'Discord\u2019s own Quests screen: shows ' + shown + ', hides ' + hid, subLabel: shown === 0 && selfQuests.length ? 'It is empty but the plugin found ' + selfQuests.length + '. The plugin asked Discord to reload; reopen the screen.' : 'What Discord itself got from the server last time you opened it.' };
+          })()),
           !!skippedHidden && h(Design.TableRow, { label: skippedHidden + ' hidden quest(s) not added to Discord’s list', subLabel: 'No details for them yet, so Discord’s quest card could not draw them.' }),
           !hasHttp && h(Design.TableRow, { label: 'Discord HTTP client NOT found', subLabel: 'Needed to load and accept quests. Reload the app and try again.' }),
           h(Design.TableRow, {
@@ -1064,6 +1073,18 @@
       storageRef = ctx.jsonStorage;
       if (ctx.plugin.startedLate) { ctx.plugin.requireReload(); return; }
 
+      // Discord's Quests screen can be left showing an old (empty) answer after the connection changes.
+      // When it shows no quests but our own fresh copy has some, ask Discord to reload its list (at most every 30 s).
+      var lastKick = 0;
+      function kickIfStale(res) {
+        try {
+          if (!isObj(res) || (Array.isArray(res.quests) && res.quests.length) || !selfQuests.length || Date.now() - lastKick < 30000) return;
+          lastKick = Date.now();
+          var m = enrollModule();
+          if (m) setTimeout(function () { try { Promise.resolve(m.fetchCurrentQuests()).catch(function () {}); } catch (e) {} }, 0);
+        } catch (e) { /* never break the screen */ }
+      }
+
       // observe Discord's quest hooks; optionally merge hidden quests into the native list
       cleanup(finders.getModules(
         finders.filters.withProps('useFilteredQuests', 'useClaimedQuests'),
@@ -1072,6 +1093,7 @@
             cleanup(V.patcher.instead(mod, name, function (args, orig) {
               var res = Reflect.apply(orig, this, args);
               lastHook[name] = res;
+              if (name === 'useFilteredQuests') kickIfStale(res);
               if (name === 'useFilteredQuests' && cfgNow().showHidden) {
                 try { return mergeHidden(res); } catch (e) { ctx.plugin.reportError(e); }
               }
