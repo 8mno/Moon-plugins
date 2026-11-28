@@ -64,11 +64,11 @@
   var META_RETRY_FAIL = 30 * 60 * 1000;
   var META_RETRY_OK = 6 * 3600 * 1000;
   var LIVE_STATUSES = ['available', 'unverified'];
-  var PROBE_MAX = 25;                      // quests asked about per run
-  var PROBE_MAX_AGE_DAYS = 60;             // older ids are not worth asking about
+  var PROBE_MAX = 10;                      // quests asked about per run
+  var PROBE_MAX_AGE_DAYS = 35;             // older ids are not worth asking about
   var PROBE_GONE_TTL = 24 * 3600 * 1000;   // how long "expired" is remembered
-  var LOCKED_TTL = 30 * 60 * 1000;         // how long "not offered to you" is remembered (short, so a new VPN gets a fresh try)
-  var PROBE_GAP = 1000;                    // ms between requests
+  var LOCKED_TTL = 6 * 3600 * 1000;        // how long "not offered to you" is remembered; a country change or "Retry" clears it sooner
+  var PROBE_GAP = 1500;                    // ms between requests
   var QUEST_HOME_MOBILE = 12;   // "location" Discord's accept request needs (QUEST_HOME_MOBILE)
   var DESKTOP_ONLY = ['PLAY_ON_DESKTOP', 'PLAY_ON_XBOX', 'PLAY_ON_PLAYSTATION', 'STREAM_ON_DESKTOP'];
   var TYPE_LABELS = {
@@ -247,7 +247,7 @@
   ];
   var geoLoading = null;
   function detectCountry(force) {
-    if (!force && ipCountry.cc && Date.now() - ipCountry.at < 5 * 60000) return Promise.resolve(false);
+    if (!force && ipCountry.cc && Date.now() - ipCountry.at < 10 * 60000) return Promise.resolve(false);
     if (!force && !ipCountry.cc && ipCountry.at && Date.now() - ipCountry.at < 2 * 60000) return Promise.resolve(false);
     if (!geoLoading) geoLoading = doDetect().then(function (r) { geoLoading = null; return r; }, function () { geoLoading = null; return false; });
     return geoLoading;
@@ -270,7 +270,7 @@
   function onCountryChanged(prev, cc) {
     clearRefused('locked'); probeNextAt = Date.now() + 30000;   // give the new connection a moment before asking Discord again
     toast('QI_COUNTRY', 'Your country is now ' + flag(cc, true) + '. Checking quests again...', false, 'globe');
-    setTimeout(function () { reloadQuests(); }, 4000);
+    setTimeout(function () { reloadQuests(true); }, 4000);
   }
   // what the server itself told us about a quest from a given country, kept so unknown regions fill in over time
   var learnedMap = {};
@@ -319,7 +319,7 @@
     return null;
   }
   function probeCandidates() {
-    return stubIds().filter(function (id) { return !isGone(id) && !isLocked(id) && idAgeDays(id) <= PROBE_MAX_AGE_DAYS; })
+    return stubIds().filter(function (id) { return !isGone(id) && !isLocked(id) && idAgeDays(id) <= PROBE_MAX_AGE_DAYS && access(id) !== 'no'; })
       .sort(function (a, b) { return idAgeDays(a) - idAgeDays(b); });   // newest first
   }
   function loadProbe() {
@@ -338,6 +338,7 @@
     probeStatus = 'checking ' + batch.length + '...';
     for (var i = 0; i < batch.length; i++) {
       try {
+        tally();
         var res = await http.get({ url: '/quests/' + encodeURIComponent(batch[i]), retries: 0 });
         var body = isObj(res) && isObj(res.body) ? res.body : res;
         var cfg = isObj(body) && isObj(body.config) ? body.config : body;
@@ -622,15 +623,31 @@
   // ---------- load the quest list ourselves, so the Quests screen never has to be opened ----------
   // GET /quests/@me is the request Discord's own Quests screen makes. Its answer has the visible quests and
   // `excluded_quests` (the hidden stubs), so the plugin can list everything on its own.
-  var SELF_TTL = 10 * 60 * 1000, SELF_TTL_ACTIVE = 2 * 60 * 1000;   // reload faster while a quest is in progress, to notice when it finishes
+  var SELF_TTL = 15 * 60 * 1000, SELF_TTL_ACTIVE = 3 * 60 * 1000;   // reload faster while a quest is in progress, to notice when it finishes
   var selfActive = false;
   var backoffUntil = 0;   // after Discord answers 429 (too many requests) the plugin stops asking for a while
-  function rateLimited(e) { if (isObj(e) && e.status === 429) { backoffUntil = Date.now() + 10 * 60000; return true; } return false; }
+  var backoffLevel = 0, lastLimitAt = 0;
+  // Honour Discord's own "retry after" when it gives one; otherwise wait 5 min, doubling (up to 1 hour) while it keeps happening.
+  function rateLimited(e) {
+    if (!isObj(e) || e.status !== 429) return false;
+    var now = Date.now();
+    backoffLevel = now - lastLimitAt < 3600000 ? Math.min(backoffLevel + 1, 4) : 1;
+    lastLimitAt = now;
+    var ra = isObj(e.body) ? Number(e.body.retry_after !== undefined ? e.body.retry_after : e.body.retryAfter) : NaN;
+    var wait = Number.isFinite(ra) && ra > 0 ? ra * 1000 + 2000 : 5 * 60000 * Math.pow(2, backoffLevel - 1);
+    backoffUntil = now + Math.max(30000, Math.min(wait, 3600000)) + Math.floor(Math.random() * 5000);
+    return true;
+  }
+  // how many requests the plugin itself sent to Discord in the last hour (shown in the settings)
+  var sentLog = [];
+  function tally() { var now = Date.now(); sentLog.push(now); while (sentLog.length && now - sentLog[0] > 3600000) sentLog.shift(); }
+  function sentLastHour() { var now = Date.now(); while (sentLog.length && now - sentLog[0] > 3600000) sentLog.shift(); return sentLog.length; }
   var selfQuests = [], selfExcluded = [], selfAt = 0, selfTried = 0, selfStatus = 'not loaded yet', selfLoading = null;
   function fetchSelf(force) {
     if (selfLoading) return selfLoading;
     if (!force && selfAt && Date.now() - selfAt < (selfActive ? SELF_TTL_ACTIVE : SELF_TTL)) return Promise.resolve(false);
     if (!force && Date.now() - selfTried < 20000) return Promise.resolve(false);
+    if (force && selfAt && Date.now() - selfTried < 10000) return Promise.resolve(false);   // button mashing never doubles the requests
     if (Date.now() < backoffUntil) return Promise.resolve(false);
     selfLoading = doFetchSelf().then(function (r) { selfLoading = null; return r; }, function () { selfLoading = null; return false; });
     return selfLoading;
@@ -640,6 +657,7 @@
     var http = httpModule();
     if (!http || typeof http.get !== 'function') { selfStatus = 'Discord HTTP client not ready yet'; return false; }
     try {
+      tally();
       var res = await http.get({ url: '/quests/@me', retries: 0 });
       var body = isObj(res) && isObj(res.body) ? res.body : res;
       var q = isObj(body) && Array.isArray(body.quests) ? body.quests : null;
@@ -657,8 +675,10 @@
     }
   }
   // reload both our own copy and Discord's store
-  function reloadQuests() {
-    var m = enrollModule();
+  // Discord's own list updates by itself after an accept or claim (it listens to the gateway), so only ask
+  // it to reload (a second request to the same endpoint) when the connection changed or the user asked.
+  function reloadQuests(alsoNative) {
+    var m = alsoNative ? enrollModule() : null;
     var native = m ? Promise.resolve().then(function () { return m.fetchCurrentQuests(); }).catch(function () {}) : Promise.resolve();
     return Promise.all([fetchSelf(true), native]);
   }
@@ -799,6 +819,7 @@
     if (sealed.metadataSealed) body0.metadata_sealed = sealed.metadataSealed;
     if (sealed.trafficMetadataSealed) body0.traffic_metadata_sealed = sealed.trafficMetadataSealed;
     viaPlugin++;
+    tally();
     try { res = await http.post({ url: '/quests/' + encodeURIComponent(x.id) + '/enroll', body: body0, retries: 0 }); }
     finally { viaPlugin--; }
     if (isObj(res) && (res.ok === false || (typeof res.status === 'number' && res.status >= 400))) throw res;
@@ -823,6 +844,7 @@
       try {
         viaPlugin++;
         var res;
+        tally();
         try { res = await http.post({ url: '/quests/' + encodeURIComponent(x.id) + '/claim-reward', body: body, retries: 0 }); }
         finally { viaPlugin--; }
         var rb = isObj(res) && isObj(res.body) ? res.body : res;
@@ -1062,7 +1084,7 @@
         '1. Turn on a VPN app set to the country with the most quests (a split-tunnel for Discord is enough).\n2. Come back here and tap “Retry refused quests”.\n3. Tap “Accept all live hidden”.\n\nThe VPN can be turned off again after accepting.');
     }
     var next;
-    if (!d.storeFound) next = { label: 'Loading quests...', sub: selfStatus + '. Tap to try again.', press: function () { setMsg('Loading...'); reloadQuests().then(function () { setMsg(selfAt ? 'Loaded.' : 'Not loaded: ' + selfStatus); }); } };
+    if (!d.storeFound) next = { label: 'Loading quests...', sub: selfStatus + '. Tap to try again.', press: function () { setMsg('Loading...'); reloadQuests(true).then(function () { setMsg(selfAt ? 'Loaded.' : 'Not loaded: ' + selfStatus); }); } };
     else if (lockedN && !liveHidden.length) next = { label: lockedN + ' quest' + (lockedN === 1 ? '' : 's') + ' not offered in your region', sub: (vpnTop.length ? 'Best VPN country: ' + vpnTop.map(function (k) { return flag(k, true) + ' (' + ccLocked.counts[k] + ')'; }).join(', ') + '. ' : '') + 'Tap for the steps.', press: vpnHelp };
     else if (liveHidden.length) next = { label: liveHidden.length + ' hidden quest' + (liveHidden.length === 1 ? ' is' : 's are') + ' ready to accept', sub: 'Tap to accept them all.', press: function () { confirmAccept(liveHidden, 'Accept ' + liveHidden.length + ' hidden quests?'); } };
     else next = { label: 'Nothing hidden is live right now', sub: 'You will get an alert when a new quest appears.' };
@@ -1108,7 +1130,7 @@
           h(Design.TableRow, {
             label: 'Retry refused quests' + (lockedN + goneN ? ' (' + (lockedN + goneN) + ')' : ''),
             subLabel: 'Forget what Discord refused so it is checked again, e.g. after turning a VPN on or off.',
-            onPress: function () { clearRefused('all'); probeNextAt = 0; setMsg('Cleared. Refreshing...'); reloadQuests().then(function () { return loadProbe(); }).then(function () { setMsg('Checked again: ' + probeStatus); }, function () { setMsg('Cleared. Pull to refresh the Quests screen.'); }); }
+            onPress: function () { clearRefused('all'); probeNextAt = 0; setMsg('Cleared. Refreshing...'); reloadQuests(true).then(function () { return loadProbe(); }).then(function () { setMsg('Checked again: ' + probeStatus); }, function () { setMsg('Cleared. Pull to refresh the Quests screen.'); }); }
           }),
           !!lockedN && h(Design.TableRow, { label: 'Why are some refused?', subLabel: 'Discord does not offer them in your region. Tap for what to do.', onPress: vpnHelp })),
 
@@ -1159,6 +1181,7 @@
           h(Design.TableRow, { label: all.length + ' quests: ' + live.length + ' available, ' + hiddenCount + ' hidden by client' + (lockedN ? ', ' + lockedN + ' not offered' : '') + (goneN ? ', ' + goneN + ' expired' : '') }),
           h(Design.TableRow, { label: 'Names: ' + (all.length - stubCount) + ' of ' + all.length + ' have details' + (stubCount ? ' (' + stubCount + ' only an id)' : ''), subLabel: 'From a community tracker (' + metaStatus + '). Quests newer than it stay as ids. Tap to download.', onPress: function () { setMsg('Downloading quest details...'); loadMeta(true).then(function (okM) { setMsg(okM ? 'Quest details updated.' : 'Quest details: ' + metaStatus); }); } }),
           h(Design.TableRow, { label: 'Regions: ' + regionStatus, subLabel: 'Updated ' + regionAge + '. Community list, may be out of date. Tap to refresh.', onPress: function () { setMsg('Updating regions...'); loadRegions(true).then(function (okR) { setMsg(okR ? 'Regions updated.' : 'Regions: ' + regionStatus); }); } }),
+          h(Design.TableRow, { label: 'Requests sent to Discord in the last hour: ' + sentLastHour(), subLabel: Date.now() < backoffUntil ? 'Discord asked for a pause, resuming in ' + Math.ceil((backoffUntil - Date.now()) / 60000) + ' min.' : 'The plugin keeps this low on purpose: it reloads every 15 min (3 min while a quest is in progress) and checks only what it must.' }),
           h(Design.TableRow, { label: 'Live check: ' + probeStatus, subLabel: 'Asks Discord if each hidden quest is still active (newest 25 at a time). Tap to run now.', onPress: function () { setMsg('Checking with Discord...'); loadProbe().then(function () { setMsg('Live check: ' + probeStatus); }); } }),
           h(Design.TableRow, (function () {
             var e = enrollLog[enrollLog.length - 1];
@@ -1181,7 +1204,7 @@
           h(Design.TableRow, {
             label: 'Refresh quests from Discord',
             subLabel: 'Quest list: ' + selfStatus + (selfAt ? ' (' + Math.max(0, Math.round((Date.now() - selfAt) / 60000)) + ' min ago)' : ''),
-            onPress: function () { setMsg('Reloading...'); reloadQuests().then(function () { setMsg(selfAt ? 'Reloaded: ' + selfStatus : 'Reload ' + selfStatus); }); }
+            onPress: function () { setMsg('Reloading...'); reloadQuests(true).then(function () { setMsg(selfAt ? 'Reloaded: ' + selfStatus : 'Reload ' + selfStatus); }); }
           }),
           h(Design.TableRow, { label: 'Copy everything as JSON', subLabel: 'Raw quests plus store/hook keys, for bug reports.', onPress: function () { copyText(safe(d), setMsg); } }))));
   }
