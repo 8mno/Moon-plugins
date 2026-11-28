@@ -42,6 +42,7 @@
     var msgS = React.useState('');
     var qS = React.useState('');
     var busyS = React.useState(false);
+    var selS = React.useState(null);   // id of the quest whose page is open
     var setMsg = msgS[1];
     function set(p) { if (storage) storage.set(p).catch(function () { setMsg('Could not save setting.'); }); }
 
@@ -86,13 +87,32 @@
         { text: 'Accept', onPress: function () { busyS[1](true); acceptList(list, setMsg).finally(function () { busyS[1](false); }); } }
       ]);
     }
-    function openQuest(x) {
-      var buttons = [];
-      if (LIVE_STATUSES.indexOf(x.status) >= 0 || x.status === 'locked') buttons.push({ text: x.status === 'locked' ? 'Try accept anyway' : 'Accept', onPress: function () { if (busyS[0]) { setMsg('Already accepting, please wait.'); return; } busyS[1](true); acceptList([x], setMsg).finally(function () { busyS[1](false); }); } });
-      if (x.claimable) buttons.unshift({ text: 'Claim reward', onPress: function () { if (busyS[0]) { setMsg('Already working, please wait.'); return; } busyS[1](true); claimList([x], setMsg).finally(function () { busyS[1](false); }); } });
-      buttons.push({ text: 'Open in Discord', onPress: function () { RN.Linking.openURL('https://discord.com/quests/' + encodeURIComponent(x.id)); } });
-      buttons.push({ text: 'Copy JSON', onPress: function () { copyText(safe(x.q), setMsg); } });
-      popup(statusIcon(x) + ' ' + (x.known ? x.name : 'Quest ' + x.id), [statusWord(x) + (x.status === 'locked' ? ' (Discord says unknown quest)' : x.status === 'unverified' ? ' (no details yet)' : ''), x.reward ? 'Reward: ' + x.reward : '', x.app ? 'Game: ' + x.app : '', timeLeft(x.expMs), regionLabel(x.id, true), x.hidden ? 'Hidden: ' + hiddenReason(x) : ''].filter(Boolean).join('\n'), buttons);
+    function openQuest(x) { selS[1](x.id); }
+    function runBusy(fn, msg) { if (busyS[0]) { setMsg('Already working, please wait.'); return; } busyS[1](true); fn().finally(function () { busyS[1](false); }); }
+    // the page of one quest: everything known about it, per-task progress and the actions
+    function questPage(x) {
+      var types = x.types.map(function (t) { return TYPE_LABELS[t] || t.toLowerCase(); }).join(', ');
+      var canAccept = LIVE_STATUSES.indexOf(x.status) >= 0 || x.status === 'locked';
+      return h(RN.ScrollView, { style: { flex: 1 }, contentContainerStyle: { paddingBottom: 24 } },
+        h(V.components.Page, null,
+          h(Design.TableRowGroup, { title: 'Quest' },
+            h(Design.TableRow, { label: '\u2190 Back to the list', onPress: function () { selS[1](null); } }),
+            h(Design.TableRow, { label: statusIcon(x) + ' ' + (x.known ? x.name : 'Quest ' + x.id), subLabel: statusWord(x) + (x.status === 'locked' ? ' (Discord says unknown quest)' : x.status === 'unverified' ? ' (no details yet)' : '') }),
+            !!x.app && h(Design.TableRow, { label: 'Game: ' + x.app }),
+            !!x.reward && h(Design.TableRow, { label: 'Reward: ' + x.reward }),
+            !!timeLeft(x.expMs) && h(Design.TableRow, { label: 'Time: ' + timeLeft(x.expMs), subLabel: Number.isFinite(x.expMs) ? 'Ends ' + new Date(x.expMs).toLocaleString() : undefined }),
+            !!types && h(Design.TableRow, { label: 'Type: ' + types }),
+            !!regionLabel(x.id, true) && h(Design.TableRow, { label: regionLabel(x.id, true), subLabel: ({ yes: 'Your country is allowed.', no: 'Your country is not allowed.', maybe: 'May work from your country.', unknown: 'Not known if your country is allowed.' })[access(x.id)] }),
+            x.hidden && h(Design.TableRow, { label: 'Hidden: ' + hiddenReason(x) }),
+            h(Design.TableRow, { label: 'Quest id: ' + x.id, subLabel: 'Tap to copy.', onPress: function () { copyText(x.id, setMsg); } })),
+          !!x.tasks.length && h(Design.TableRowGroup, { title: 'Tasks' },
+            x.tasks.map(function (t, k) { return h(Design.TableRow, { key: k, label: t.label + ': ' + t.text, subLabel: bar(t.pct) + ' ' + t.pct + '%' }); })),
+          h(Design.TableRowGroup, { title: 'Actions' },
+            !!x.claimable && h(Design.TableRow, { label: 'Claim reward', onPress: function () { runBusy(function () { return claimList([x], setMsg); }); } }),
+            canAccept && h(Design.TableRow, { label: x.status === 'locked' ? 'Try accept anyway' : 'Accept', onPress: function () { runBusy(function () { return acceptList([x], setMsg); }); } }),
+            h(Design.TableRow, { label: 'Open in Discord', onPress: function () { RN.Linking.openURL('https://discord.com/quests/' + encodeURIComponent(x.id)).catch(function () { setMsg('Could not open Discord.'); }); } }),
+            h(Design.TableRow, { label: 'Copy JSON', onPress: function () { copyText(safe(x.q), setMsg); } }),
+            !!msgS[0] && h(Design.TableRow, { label: msgS[0], subLabel: 'Tap to dismiss.', onPress: function () { setMsg(''); } }))));
     }
     var health = healthItems();
     var regionAge = regionsAt ? Math.max(0, Math.round((Date.now() - regionsAt) / 3600000)) + 'h ago' : 'never';
@@ -107,7 +127,8 @@
         '1. Turn on a VPN app set to the country with the most quests (a split-tunnel for Discord is enough).\n2. Come back here and tap “Retry refused quests”.\n3. Tap “Accept all live hidden”.\n\nThe VPN can be turned off again after accepting.');
     }
     var next;
-    if (!d.storeFound) next = { label: 'Loading quests...', sub: selfStatus + '. Tap to try again.', press: function () { setMsg('Loading...'); reloadQuests(true).then(function () { setMsg(selfAt ? 'Loaded.' : 'Not loaded: ' + selfStatus); }); } };
+    if (d.fromSnapshot) next = { label: 'Showing your saved list', sub: selfStatus + '. Accepting waits for the fresh list.', press: function () { setMsg('Loading...'); reloadQuests(true).then(function () { setMsg(selfAt ? 'Loaded.' : 'Not loaded: ' + selfStatus); }); } };
+    else if (!d.storeFound) next = { label: 'Loading quests...', sub: selfStatus + '. Tap to try again.', press: function () { setMsg('Loading...'); reloadQuests(true).then(function () { setMsg(selfAt ? 'Loaded.' : 'Not loaded: ' + selfStatus); }); } };
     else if (lockedN && !liveHidden.length) next = { label: lockedN + ' quest' + (lockedN === 1 ? '' : 's') + ' not offered in your region', sub: (vpnTop.length ? 'Best VPN country: ' + vpnTop.map(function (k) { return flag(k, true) + ' (' + ccLocked.counts[k] + ')'; }).join(', ') + '. ' : '') + 'Tap for the steps.', press: vpnHelp };
     else if (liveHidden.length) next = { label: liveHidden.length + ' hidden quest' + (liveHidden.length === 1 ? ' is' : 's are') + ' ready to accept', sub: 'Tap to accept them all.', press: function () { confirmAccept(liveHidden, 'Accept ' + liveHidden.length + ' hidden quests?'); } };
     else next = { label: 'Nothing hidden is live right now', sub: 'You will get an alert when a new quest appears.' };
@@ -116,6 +137,20 @@
     function howTo() {
       popup('How to use Quest Inspector', '1. The plugin loads your quests by itself.\n2. The top row tells you the next step. Tap \u201cAccept all live hidden\u201d to accept every hidden quest that is live.\n3. If Discord refuses quests for your region, turn on a VPN in the country shown under \u201cVPN apps\u201d. The plugin notices the new country and checks again.\n4. Accepted quests show their progress at the top, and you get a reminder before they expire.');
     }
+
+    var opened = selS[0] ? all.filter(function (z) { return z.id === selS[0]; })[0] : null;
+    if (opened) return questPage(opened);
+    // rows of the quest list (also used for the grouped sections)
+    function questRow(x) {
+      var types = x.types.map(function (t) { return TYPE_LABELS[t] || t.toLowerCase(); }).join(', ');
+      var left = x.status === 'expired' || x.status === 'gone' || x.status === 'old' ? '' : timeLeft(x.expMs);
+      return h(Design.TableRow, {
+        key: x.id, label: statusIcon(x) + ' ' + (x.known ? x.name : 'Quest ' + String(x.id).slice(-8)),
+        subLabel: [statusWord(x), x.reward, left, regionLabel(x.id), x.app, types, x.hidden && x.status !== 'locked' ? 'hidden' : '', Number.isFinite(x.progress) && x.status === 'enrolled' ? x.progress + '% done' : ''].filter(Boolean).join(' \u00b7 '),
+        onPress: function () { openQuest(x); }
+      });
+    }
+    var sections = groupQuests(view, c.group);
 
     return h(RN.ScrollView, { style: { flex: 1 }, contentContainerStyle: { paddingBottom: 24 } },
       h(V.components.Page, null,
@@ -167,22 +202,18 @@
           })()),
           h(Design.TableRow, { label: 'Show: ' + c.filter + ' (' + view.length + ')', subLabel: 'Tap to change. Next: ' + cycle(FILTERS, c.filter) + '. All options: ' + FILTERS.join(', ') + '.', onPress: function () { set({ filter: cycle(FILTERS, c.filter) }); } }),
           h(Design.TableRow, { label: 'Region: ' + c.region, subLabel: 'Tap to change: ' + REGION_FILTERS.join(' / ') + '. You can also search a country code like US or IQ.', onPress: function () { set({ region: cycle(REGION_FILTERS, c.region) }); } }),
+          h(Design.TableRow, { label: 'Group by: ' + c.group, subLabel: 'Tap to change: ' + GROUPS.join(' / ') + '.', onPress: function () { set({ group: cycle(GROUPS, c.group) }); } }),
           cc.top.length > 0 && h(Design.TableRow, {
             label: 'Unlock by country: ' + cc.top.slice(0, 3).map(function (code) { return flag(code, true) + ' (' + cc.counts[code] + ')'; }).join(', '),
             subLabel: 'Live hidden quests each country would show you. Tap for the full list.',
             onPress: showCountries
           }),
           view.length === 0
-            ? h(Design.TableRow, { label: q ? 'No quests match “' + q + '”' : 'No quests in this view', subLabel: q ? 'Clear the search or change “Show”.' : 'Try “Show: all”.' })
-            : view.map(function (x) {
-                var types = x.types.map(function (t) { return TYPE_LABELS[t] || t.toLowerCase(); }).join(', ');
-                var left = x.status === 'expired' || x.status === 'gone' || x.status === 'old' ? '' : timeLeft(x.expMs);
-                return h(Design.TableRow, {
-                  key: x.id, label: statusIcon(x) + ' ' + (x.known ? x.name : 'Quest ' + String(x.id).slice(-8)),
-                  subLabel: [statusWord(x), x.reward, left, regionLabel(x.id), x.app, types, x.hidden && x.status !== 'locked' ? 'hidden' : '', Number.isFinite(x.progress) && x.status === 'enrolled' ? x.progress + '% done' : ''].filter(Boolean).join(' \u00b7 '),
-                  onPress: function () { openQuest(x); }
-                });
-              })),
+            ? h(Design.TableRow, { label: q ? 'No quests match \u201c' + q + '\u201d' : 'No quests in this view', subLabel: q ? 'Clear the search or change \u201cShow\u201d.' : 'Try \u201cShow: all\u201d.' })
+            : c.group === 'none' ? view.map(questRow) : null),
+        c.group !== 'none' && sections.map(function (sec) {
+          return h(Design.TableRowGroup, { key: sec.title, title: sec.title + ' (' + sec.items.length + ')' }, sec.items.map(questRow));
+        }),
 
         h(Design.TableRowGroup, { title: 'VPN apps' },
           h(Design.TableRow, { label: vpnTop.length ? 'Best country now: ' + vpnTop.map(function (k) { return flag(k, true); }).join(', ') : 'Pick a country that unlocks the most quests', subLabel: 'Switch the VPN to it, and the plugin notices and re-checks by itself.', onPress: vpnHelp }),
@@ -193,6 +224,12 @@
           h(Design.TableSwitchRow, { label: 'Show live hidden quests in Discord’s Quests screen', subLabel: 'Adds hidden quests that are available or accepted to the native list. Reload after changing.', value: !!c.showHidden, onValueChange: function (v) { set({ showHidden: v }); } }),
           h(Design.TableSwitchRow, { label: 'Find my country from my IP', subLabel: 'Asks api.country.is (then ipwho.is) which country your connection is in. Nothing else is sent.', value: !!c.detectIp, onValueChange: function (v) { set({ detectIp: v }); if (v) detectCountry(true); } }),
           h(Design.TableSwitchRow, { label: 'Claim rewards automatically', subLabel: 'Claims a quest\u2019s reward once all its tasks are done. Failures show in the Last accept log.', value: !!c.autoClaim, onValueChange: function (v) { set({ autoClaim: v }); } }),
+          h(Design.TableSwitchRow, { label: 'Accept new quests automatically', subLabel: 'Off by default. Only quests that appear after you turn this on. Stops by itself if Discord asks for a captcha.', value: !!c.autoAccept, onValueChange: function (v) {
+            if (!v) { set({ autoAccept: false }); return; }
+            if (!selfAt) { setMsg('Wait until your quests have loaded, then turn this on.'); return; }
+            set({ autoAccept: true, aaBase: all.map(function (z) { return z.id; }).slice(-1000) });
+            setMsg('Auto-accept is on. The ' + all.length + ' quests that exist now are left alone.');
+          } }),
           h(Design.TableSwitchRow, { label: 'Remind me before accepted quests expire', subLabel: 'A toast 24 hours and 3 hours before.', value: !!c.remind, onValueChange: function (v) { set({ remind: v }); } }),
           h(Design.TableSwitchRow, { label: 'Alert me about new quests', subLabel: 'Says when a new quest is a hidden one.', value: !!c.alertNew, onValueChange: function (v) { set({ alertNew: v }); } }),
           h(Design.TableSwitchRow, { label: 'Soonest-expiring first', value: !!c.sortSoonest, onValueChange: function (v) { set({ sortSoonest: v }); } }),

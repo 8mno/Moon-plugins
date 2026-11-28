@@ -47,10 +47,15 @@
     goneClearedAt: 0,    // "Retry refused quests" was pressed at this time: older refusals are ignored
     lockedClearedAt: 0,
     locked: {},          // quest id -> when Discord said it is unknown (not offered to this account/region)
+    autoAccept: false,   // opt-in: accept quests that appear after it was switched on
+    aaBase: [],          // quest ids that already existed when auto-accept was switched on (never auto-accepted)
+    group: 'none',       // none | game | reward | status
+    snapshot: null,      // { at, json } last quest list, so the screen is filled before the first load
     acceptDelay: 1500,   // ms between "Accept all" requests
     seeded: false,
     seen: []
   };
+  var GROUPS = ['none', 'game', 'reward', 'status'];
   var FILTERS = ['live hidden', 'all', 'available', 'enrolled', 'hidden', 'finished', 'not offered'];
   var REGION_FILTERS = ['any', 'global', 'regional'];
   // Third-party, community-kept list of which countries each quest is limited to. It is only used
@@ -78,7 +83,7 @@
     STREAM_ON_DESKTOP: 'stream', ACHIEVEMENT_IN_ACTIVITY: 'activity achievement'
   };
 
-  var PLUGIN_VERSION = '0.8.2';   // filled in from manifest.json by build.js
+  var PLUGIN_VERSION = '0.9.0';   // filled in from manifest.json by build.js
   var rowRegistered = false;  // the row in Valenced's settings list
   var lastClaimPlatform = null;
   var lastHook = {};        // last results seen from Discord's own quest hooks
@@ -590,17 +595,20 @@
     var tasks = isObj(tc) && isObj(tc.tasks) ? tc.tasks : null;
     var prog = isObj(us.progress) ? us.progress : null;
     out.taskText = [];
-    if (tasks && prog) {
-      var sum = 0, n = 0;
+    out.tasks = [];
+    if (tasks) {
+      var sum = 0, n = 0, pg = prog || {};
       Object.keys(tasks).forEach(function (k) {
         var target = isObj(tasks[k]) ? Number(tasks[k].target) : NaN;
         if (!(target > 0)) return;
-        var val = isObj(prog[k]) ? Number(prog[k].value) || 0 : 0;
+        var val = isObj(pg[k]) ? Number(pg[k].value) || 0 : 0;
         sum += Math.min(val / target, 1); n++;
         var secs = ['WATCH_VIDEO', 'WATCH_VIDEO_ON_MOBILE', 'PLAY_ON_DESKTOP', 'PLAY_ON_XBOX', 'PLAY_ON_PLAYSTATION', 'PLAY_ACTIVITY', 'STREAM_ON_DESKTOP'].indexOf(k) >= 0 && target >= 60;
-        out.taskText.push((TYPE_LABELS[k] || k.toLowerCase()) + ' ' + (secs ? Math.floor(Math.min(val, target) / 60) + '/' + Math.floor(target / 60) + ' min' : Math.min(val, target) + '/' + target));
+        var txt0 = secs ? Math.floor(Math.min(val, target) / 60) + '/' + Math.floor(target / 60) + ' min' : Math.min(val, target) + '/' + target;
+        out.tasks.push({ label: TYPE_LABELS[k] || k.toLowerCase(), pct: Math.round(Math.min(val / target, 1) * 100), text: txt0 });
+        if (prog) out.taskText.push((TYPE_LABELS[k] || k.toLowerCase()) + ' ' + txt0);
       });
-      if (n) out.progress = Math.round(sum / n * 100);
+      if (n && prog) out.progress = Math.round(sum / n * 100);
     }
     out.app = isObj(cfg.application) && typeof cfg.application.name === 'string' ? cfg.application.name : '';
     var txt = out.app;
@@ -645,6 +653,7 @@
   var sentLog = [];
   function tally() { var now = Date.now(); sentLog.push(now); while (sentLog.length && now - sentLog[0] > 3600000) sentLog.shift(); }
   function sentLastHour() { var now = Date.now(); while (sentLog.length && now - sentLog[0] > 3600000) sentLog.shift(); return sentLog.length; }
+  var snapshotAt = 0;   // when the saved list (shown until the first real load) was taken
   var selfQuests = [], selfExcluded = [], selfAt = 0, selfTried = 0, selfStatus = 'not loaded yet', selfLoading = null;
   function fetchSelf(force) {
     if (selfLoading) return selfLoading;
@@ -671,12 +680,53 @@
       selfAt = Date.now();
       selfActive = selfQuests.some(function (e) { var u = isObj(e.userStatus) ? e.userStatus : null; return u && u.enrolledAt && !u.completedAt && !u.claimedAt; });
       selfStatus = selfQuests.length + ' quests + ' + selfExcluded.length + ' hidden, loaded by the plugin';
+      saveSnapshot();
       return true;
     } catch (e) {
       selfStatus = rateLimited(e) ? 'Discord asked us to slow down, trying again in 10 min' : 'failed: ' + errText(e);
       return false;
     }
   }
+  // ---- saved copy of the list: the settings screen is filled the moment it opens, before the first request answers.
+  // It is stored as one JSON string (Valenced merges stored objects and arrays key by key, so a shorter list would keep old leftovers).
+  // Only what is needed to draw a row is kept, and no sealed strings. Actions never run on it: they need a fresh load (selfAt > 0).
+  function trimQuest(q) {
+    var c = isObj(q.config) ? q.config : null, o = { id: q.id };
+    if (c) {
+      var m = isObj(c.messages) ? c.messages : {}, tc = c.taskConfigV2 || c.taskConfig, rc = c.rewardsConfig, rw = isObj(rc) && Array.isArray(rc.rewards) && isObj(rc.rewards[0]) ? rc.rewards[0] : null, rm = rw && isObj(rw.messages) ? rw.messages : {};
+      var tasks = {};
+      if (isObj(tc) && isObj(tc.tasks)) Object.keys(tc.tasks).forEach(function (k) { tasks[k] = { target: isObj(tc.tasks[k]) ? tc.tasks[k].target : 0 }; });
+      o.config = { expiresAt: c.expiresAt, messages: { questName: m.questName, gameTitle: m.gameTitle }, taskConfigV2: { tasks: tasks },
+        rewardsConfig: { platforms: isObj(rc) ? rc.platforms : undefined, rewards: rw ? [{ orbQuantity: rw.orbQuantity, messages: { name: rm.name, nameWithArticle: rm.nameWithArticle } }] : [] },
+        application: { name: isObj(c.application) ? c.application.name : undefined } };
+    }
+    var u = isObj(q.userStatus) ? q.userStatus : null;
+    if (u) o.userStatus = { enrolledAt: u.enrolledAt, completedAt: u.completedAt, claimedAt: u.claimedAt, progress: u.progress };
+    return o;
+  }
+  function newestIds(list, max) {
+    return list.map(function (e) { return e.id; }).sort(function (a, b) { return a.length !== b.length ? b.length - a.length : (a < b ? 1 : -1); }).slice(0, max);
+  }
+  function saveSnapshot() {
+    try {
+      if (!storageRef) return;
+      var data = { q: selfQuests.slice(0, 60).map(trimQuest), x: newestIds(selfExcluded, 60) };
+      storageRef.set({ snapshot: { at: selfAt, json: JSON.stringify(data) } }).catch(function () {});
+    } catch (e) { /* the saved copy is only a convenience */ }
+  }
+  function loadSnapshot(s) {
+    try {
+      if (!isObj(s) || typeof s.json !== 'string' || !(s.at > Date.now() - 14 * 86400000)) return;
+      var d = JSON.parse(s.json);
+      if (!isObj(d) || !Array.isArray(d.q) || !Array.isArray(d.x)) return;
+      var ok = function (e) { return isObj(e) && typeof e.id === 'string' && /^\d{5,25}$/.test(e.id); };
+      selfQuests = d.q.filter(ok);
+      selfExcluded = d.x.filter(function (id) { return typeof id === 'string' && /^\d{5,25}$/.test(id); }).map(function (id) { return { id: id }; });
+      snapshotAt = s.at;
+      selfStatus = 'saved list from ' + Math.max(0, Math.round((Date.now() - s.at) / 60000)) + ' min ago, refreshing';
+    } catch (e) { /* ignore a damaged copy */ }
+  }
+
   // reload both our own copy and Discord's store
   // Discord's own list updates by itself after an accept or claim (it listens to the gateway), so only ask
   // it to reload (a second request to the same endpoint) when the connection changed or the user asked.
@@ -693,8 +743,13 @@
     // After a connection change Discord's own list can be an old answer. When our copy is newer than the
     // last time its screen rendered, trust ours alone for what is shown and what is hidden.
     var ours = selfAt > 0 && selfAt >= lastHookAt;
+    // the saved copy only stands in until something live exists; it must never outvote Discord's own current lists
+    var fromSnapshot = selfAt === 0 && snapshotAt > 0;
+    var live = !!f || toList(s && s.quests).length > 0;
+    var useSelf = !(fromSnapshot && live);
     return {
-      storeFound: !!s || selfAt > 0,
+      fromSnapshot: fromSnapshot && !live,
+      storeFound: !!s || selfAt > 0 || snapshotAt > 0,
       storeKeys: s ? Object.keys(s).slice(0, 40) : [],
       store: ours ? [] : toList(s && s.quests),
       storeClaimed: toList(s && s.claimedQuests),
@@ -702,8 +757,8 @@
       hookQuests: ours ? [] : toList(f && f.quests),
       hookExcluded: ours ? [] : toList(f && f.excludedQuests),
       hookClaimed: toList(c && (c.claimedQuests || c.quests)),
-      selfQuests: selfQuests,
-      selfExcluded: selfExcluded,
+      selfQuests: useSelf ? selfQuests : [],
+      selfExcluded: useSelf ? selfExcluded : [],
       hookKeys: isObj(f) ? Object.keys(f) : []
     };
   }
@@ -731,6 +786,28 @@
     var guess = inferRegion(infos);
     userRegion = cfgNow().detectIp && ipCountry.cc ? { codes: [ipCountry.cc], n: guess.n, from: 'ip', guess: guess.codes } : { codes: guess.codes, n: guess.n, from: 'quests', guess: guess.codes };
     return infos;
+  }
+
+  // Sections for the grouped list. Status sections come in a fixed order; the others biggest first.
+  var STATUS_GROUPS = ['Ready to claim', 'In progress', 'Available', 'Not offered to you', 'Finished or expired'];
+  function statusGroup(x) {
+    if (x.claimable) return STATUS_GROUPS[0];
+    if (x.status === 'enrolled') return STATUS_GROUPS[1];
+    if (LIVE_STATUSES.indexOf(x.status) >= 0) return STATUS_GROUPS[2];
+    if (x.status === 'locked') return STATUS_GROUPS[3];
+    return STATUS_GROUPS[4];
+  }
+  function groupQuests(list, mode) {
+    if (mode !== 'game' && mode !== 'reward' && mode !== 'status') return [{ title: '', items: list }];
+    var map = {}, order = [];
+    list.forEach(function (x) {
+      var key = mode === 'status' ? statusGroup(x) : mode === 'game' ? (x.app || 'No game info') : (x.reward || 'No reward info');
+      if (!Object.prototype.hasOwnProperty.call(map, key)) { map[key] = []; order.push(key); }
+      map[key].push(x);
+    });
+    if (mode === 'status') order.sort(function (a, b) { return STATUS_GROUPS.indexOf(a) - STATUS_GROUPS.indexOf(b); });
+    else order.sort(function (a, b) { return map[b].length - map[a].length || a.localeCompare(b); });
+    return order.map(function (k) { return { title: k, items: map[k] }; });
   }
 
   function applyView(list, c, query) {
@@ -874,7 +951,7 @@
   }
   var claiming = false;
   async function autoClaim() {
-    if (claiming || Date.now() < backoffUntil) return;
+    if (claiming || selfAt <= 0 || Date.now() < backoffUntil) return;
     var todo = unify(collect()).filter(function (x) { return x.claimable && claimDue(x); });
     if (!todo.length) return;
     claiming = true;
@@ -896,6 +973,7 @@
     } finally { claiming = false; }
   }
   async function claimList(list, setMsg) {
+    if (selfAt <= 0) { setMsg('Your quests are still loading. Try again in a moment.'); return; }
     var ok = 0, fail = [], okNames = [];
     for (var i = 0; i < list.length; i++) {
       setMsg('Claiming ' + (i + 1) + '/' + list.length + ': ' + list[i].name + '...');
@@ -912,7 +990,50 @@
     popup(ok === list.length ? 'All ' + ok + ' claimed' : ok + ' of ' + list.length + ' claimed', lines.join('\n\n'));
   }
 
+  // ---- opt-in: accept quests that appear after the switch was turned on
+  var aaTried = {};        // quest id -> { n, at }: every quest is tried at most twice
+  var autoAccepting = false;
+  function isCaptcha(e) {
+    var b = isObj(e) && isObj(e.body) ? e.body : {};
+    return !!(b.captcha_key || b.captcha_sitekey || b.captcha_service || b.captchaKey);
+  }
+  async function autoAccept(onStop) {
+    var c = cfgNow();
+    // needs a list loaded by the plugin in the last 20 minutes: the saved copy is never enough
+    if (!c.autoAccept || autoAccepting || selfAt <= 0 || Date.now() - selfAt > 20 * 60000 || Date.now() < backoffUntil) return;
+    var base = new Set(Array.isArray(c.aaBase) ? c.aaBase : []);
+    var todo = unify(collect()).filter(function (x) {
+      if (base.has(x.id) || LIVE_STATUSES.indexOf(x.status) < 0) return false;
+      var t = own(aaTried, x.id);
+      return !t || (t.n < 2 && Date.now() - t.at > 30 * 60000);
+    }).slice(0, 3);
+    if (!todo.length) return;
+    autoAccepting = true;
+    var any = false;
+    try {
+      for (var i = 0; i < todo.length; i++) {
+        var x = todo[i], t = aaTried[x.id] || { n: 0, at: 0 };
+        t.n++; t.at = Date.now(); aaTried[x.id] = t;
+        try {
+          await enrollOne(x); any = true; t.n = 99;
+          toast('QI_AUTO_' + x.id, 'Accepted: ' + (x.known ? x.name : 'a new quest') + (x.reward ? ' (' + x.reward + ')' : ''), false, 'ok');
+        } catch (e) {
+          if (isCaptcha(e)) {
+            // Discord wants a human check: automatic accepting must not go on
+            if (onStop) onStop();
+            toast('QI_AUTO_CAPTCHA', 'Auto-accept turned off: Discord asked for a captcha. Accept quests yourself.', true, 'bad');
+            break;
+          }
+          if (t.n === 1) toast('QI_AUTOFAIL_' + x.id, 'Could not auto-accept ' + (x.known ? x.name : 'a quest') + ': ' + errText(e).slice(0, 80), true, 'bad');
+          if (Date.now() < backoffUntil) break;
+        }
+        if (i < todo.length - 1) await sleep(c.acceptDelay);
+      }
+      if (any) await reloadQuests();
+    } finally { autoAccepting = false; }
+  }
   async function acceptList(list, setMsg) {
+    if (selfAt <= 0) { setMsg('Your quests are still loading. Try again in a moment.'); return; }
     var ok = 0, fail = [], okNames = [], lockedCount = 0, delay = cfgNow().acceptDelay;
     for (var i = 0; i < list.length; i++) {
       setMsg('Accepting ' + (i + 1) + '/' + list.length + ': ' + list[i].name + '...');
@@ -1061,6 +1182,7 @@
     var msgS = React.useState('');
     var qS = React.useState('');
     var busyS = React.useState(false);
+    var selS = React.useState(null);   // id of the quest whose page is open
     var setMsg = msgS[1];
     function set(p) { if (storage) storage.set(p).catch(function () { setMsg('Could not save setting.'); }); }
 
@@ -1105,13 +1227,32 @@
         { text: 'Accept', onPress: function () { busyS[1](true); acceptList(list, setMsg).finally(function () { busyS[1](false); }); } }
       ]);
     }
-    function openQuest(x) {
-      var buttons = [];
-      if (LIVE_STATUSES.indexOf(x.status) >= 0 || x.status === 'locked') buttons.push({ text: x.status === 'locked' ? 'Try accept anyway' : 'Accept', onPress: function () { if (busyS[0]) { setMsg('Already accepting, please wait.'); return; } busyS[1](true); acceptList([x], setMsg).finally(function () { busyS[1](false); }); } });
-      if (x.claimable) buttons.unshift({ text: 'Claim reward', onPress: function () { if (busyS[0]) { setMsg('Already working, please wait.'); return; } busyS[1](true); claimList([x], setMsg).finally(function () { busyS[1](false); }); } });
-      buttons.push({ text: 'Open in Discord', onPress: function () { RN.Linking.openURL('https://discord.com/quests/' + encodeURIComponent(x.id)); } });
-      buttons.push({ text: 'Copy JSON', onPress: function () { copyText(safe(x.q), setMsg); } });
-      popup(statusIcon(x) + ' ' + (x.known ? x.name : 'Quest ' + x.id), [statusWord(x) + (x.status === 'locked' ? ' (Discord says unknown quest)' : x.status === 'unverified' ? ' (no details yet)' : ''), x.reward ? 'Reward: ' + x.reward : '', x.app ? 'Game: ' + x.app : '', timeLeft(x.expMs), regionLabel(x.id, true), x.hidden ? 'Hidden: ' + hiddenReason(x) : ''].filter(Boolean).join('\n'), buttons);
+    function openQuest(x) { selS[1](x.id); }
+    function runBusy(fn, msg) { if (busyS[0]) { setMsg('Already working, please wait.'); return; } busyS[1](true); fn().finally(function () { busyS[1](false); }); }
+    // the page of one quest: everything known about it, per-task progress and the actions
+    function questPage(x) {
+      var types = x.types.map(function (t) { return TYPE_LABELS[t] || t.toLowerCase(); }).join(', ');
+      var canAccept = LIVE_STATUSES.indexOf(x.status) >= 0 || x.status === 'locked';
+      return h(RN.ScrollView, { style: { flex: 1 }, contentContainerStyle: { paddingBottom: 24 } },
+        h(V.components.Page, null,
+          h(Design.TableRowGroup, { title: 'Quest' },
+            h(Design.TableRow, { label: '\u2190 Back to the list', onPress: function () { selS[1](null); } }),
+            h(Design.TableRow, { label: statusIcon(x) + ' ' + (x.known ? x.name : 'Quest ' + x.id), subLabel: statusWord(x) + (x.status === 'locked' ? ' (Discord says unknown quest)' : x.status === 'unverified' ? ' (no details yet)' : '') }),
+            !!x.app && h(Design.TableRow, { label: 'Game: ' + x.app }),
+            !!x.reward && h(Design.TableRow, { label: 'Reward: ' + x.reward }),
+            !!timeLeft(x.expMs) && h(Design.TableRow, { label: 'Time: ' + timeLeft(x.expMs), subLabel: Number.isFinite(x.expMs) ? 'Ends ' + new Date(x.expMs).toLocaleString() : undefined }),
+            !!types && h(Design.TableRow, { label: 'Type: ' + types }),
+            !!regionLabel(x.id, true) && h(Design.TableRow, { label: regionLabel(x.id, true), subLabel: ({ yes: 'Your country is allowed.', no: 'Your country is not allowed.', maybe: 'May work from your country.', unknown: 'Not known if your country is allowed.' })[access(x.id)] }),
+            x.hidden && h(Design.TableRow, { label: 'Hidden: ' + hiddenReason(x) }),
+            h(Design.TableRow, { label: 'Quest id: ' + x.id, subLabel: 'Tap to copy.', onPress: function () { copyText(x.id, setMsg); } })),
+          !!x.tasks.length && h(Design.TableRowGroup, { title: 'Tasks' },
+            x.tasks.map(function (t, k) { return h(Design.TableRow, { key: k, label: t.label + ': ' + t.text, subLabel: bar(t.pct) + ' ' + t.pct + '%' }); })),
+          h(Design.TableRowGroup, { title: 'Actions' },
+            !!x.claimable && h(Design.TableRow, { label: 'Claim reward', onPress: function () { runBusy(function () { return claimList([x], setMsg); }); } }),
+            canAccept && h(Design.TableRow, { label: x.status === 'locked' ? 'Try accept anyway' : 'Accept', onPress: function () { runBusy(function () { return acceptList([x], setMsg); }); } }),
+            h(Design.TableRow, { label: 'Open in Discord', onPress: function () { RN.Linking.openURL('https://discord.com/quests/' + encodeURIComponent(x.id)).catch(function () { setMsg('Could not open Discord.'); }); } }),
+            h(Design.TableRow, { label: 'Copy JSON', onPress: function () { copyText(safe(x.q), setMsg); } }),
+            !!msgS[0] && h(Design.TableRow, { label: msgS[0], subLabel: 'Tap to dismiss.', onPress: function () { setMsg(''); } }))));
     }
     var health = healthItems();
     var regionAge = regionsAt ? Math.max(0, Math.round((Date.now() - regionsAt) / 3600000)) + 'h ago' : 'never';
@@ -1126,7 +1267,8 @@
         '1. Turn on a VPN app set to the country with the most quests (a split-tunnel for Discord is enough).\n2. Come back here and tap “Retry refused quests”.\n3. Tap “Accept all live hidden”.\n\nThe VPN can be turned off again after accepting.');
     }
     var next;
-    if (!d.storeFound) next = { label: 'Loading quests...', sub: selfStatus + '. Tap to try again.', press: function () { setMsg('Loading...'); reloadQuests(true).then(function () { setMsg(selfAt ? 'Loaded.' : 'Not loaded: ' + selfStatus); }); } };
+    if (d.fromSnapshot) next = { label: 'Showing your saved list', sub: selfStatus + '. Accepting waits for the fresh list.', press: function () { setMsg('Loading...'); reloadQuests(true).then(function () { setMsg(selfAt ? 'Loaded.' : 'Not loaded: ' + selfStatus); }); } };
+    else if (!d.storeFound) next = { label: 'Loading quests...', sub: selfStatus + '. Tap to try again.', press: function () { setMsg('Loading...'); reloadQuests(true).then(function () { setMsg(selfAt ? 'Loaded.' : 'Not loaded: ' + selfStatus); }); } };
     else if (lockedN && !liveHidden.length) next = { label: lockedN + ' quest' + (lockedN === 1 ? '' : 's') + ' not offered in your region', sub: (vpnTop.length ? 'Best VPN country: ' + vpnTop.map(function (k) { return flag(k, true) + ' (' + ccLocked.counts[k] + ')'; }).join(', ') + '. ' : '') + 'Tap for the steps.', press: vpnHelp };
     else if (liveHidden.length) next = { label: liveHidden.length + ' hidden quest' + (liveHidden.length === 1 ? ' is' : 's are') + ' ready to accept', sub: 'Tap to accept them all.', press: function () { confirmAccept(liveHidden, 'Accept ' + liveHidden.length + ' hidden quests?'); } };
     else next = { label: 'Nothing hidden is live right now', sub: 'You will get an alert when a new quest appears.' };
@@ -1135,6 +1277,20 @@
     function howTo() {
       popup('How to use Quest Inspector', '1. The plugin loads your quests by itself.\n2. The top row tells you the next step. Tap \u201cAccept all live hidden\u201d to accept every hidden quest that is live.\n3. If Discord refuses quests for your region, turn on a VPN in the country shown under \u201cVPN apps\u201d. The plugin notices the new country and checks again.\n4. Accepted quests show their progress at the top, and you get a reminder before they expire.');
     }
+
+    var opened = selS[0] ? all.filter(function (z) { return z.id === selS[0]; })[0] : null;
+    if (opened) return questPage(opened);
+    // rows of the quest list (also used for the grouped sections)
+    function questRow(x) {
+      var types = x.types.map(function (t) { return TYPE_LABELS[t] || t.toLowerCase(); }).join(', ');
+      var left = x.status === 'expired' || x.status === 'gone' || x.status === 'old' ? '' : timeLeft(x.expMs);
+      return h(Design.TableRow, {
+        key: x.id, label: statusIcon(x) + ' ' + (x.known ? x.name : 'Quest ' + String(x.id).slice(-8)),
+        subLabel: [statusWord(x), x.reward, left, regionLabel(x.id), x.app, types, x.hidden && x.status !== 'locked' ? 'hidden' : '', Number.isFinite(x.progress) && x.status === 'enrolled' ? x.progress + '% done' : ''].filter(Boolean).join(' \u00b7 '),
+        onPress: function () { openQuest(x); }
+      });
+    }
+    var sections = groupQuests(view, c.group);
 
     return h(RN.ScrollView, { style: { flex: 1 }, contentContainerStyle: { paddingBottom: 24 } },
       h(V.components.Page, null,
@@ -1186,22 +1342,18 @@
           })()),
           h(Design.TableRow, { label: 'Show: ' + c.filter + ' (' + view.length + ')', subLabel: 'Tap to change. Next: ' + cycle(FILTERS, c.filter) + '. All options: ' + FILTERS.join(', ') + '.', onPress: function () { set({ filter: cycle(FILTERS, c.filter) }); } }),
           h(Design.TableRow, { label: 'Region: ' + c.region, subLabel: 'Tap to change: ' + REGION_FILTERS.join(' / ') + '. You can also search a country code like US or IQ.', onPress: function () { set({ region: cycle(REGION_FILTERS, c.region) }); } }),
+          h(Design.TableRow, { label: 'Group by: ' + c.group, subLabel: 'Tap to change: ' + GROUPS.join(' / ') + '.', onPress: function () { set({ group: cycle(GROUPS, c.group) }); } }),
           cc.top.length > 0 && h(Design.TableRow, {
             label: 'Unlock by country: ' + cc.top.slice(0, 3).map(function (code) { return flag(code, true) + ' (' + cc.counts[code] + ')'; }).join(', '),
             subLabel: 'Live hidden quests each country would show you. Tap for the full list.',
             onPress: showCountries
           }),
           view.length === 0
-            ? h(Design.TableRow, { label: q ? 'No quests match “' + q + '”' : 'No quests in this view', subLabel: q ? 'Clear the search or change “Show”.' : 'Try “Show: all”.' })
-            : view.map(function (x) {
-                var types = x.types.map(function (t) { return TYPE_LABELS[t] || t.toLowerCase(); }).join(', ');
-                var left = x.status === 'expired' || x.status === 'gone' || x.status === 'old' ? '' : timeLeft(x.expMs);
-                return h(Design.TableRow, {
-                  key: x.id, label: statusIcon(x) + ' ' + (x.known ? x.name : 'Quest ' + String(x.id).slice(-8)),
-                  subLabel: [statusWord(x), x.reward, left, regionLabel(x.id), x.app, types, x.hidden && x.status !== 'locked' ? 'hidden' : '', Number.isFinite(x.progress) && x.status === 'enrolled' ? x.progress + '% done' : ''].filter(Boolean).join(' \u00b7 '),
-                  onPress: function () { openQuest(x); }
-                });
-              })),
+            ? h(Design.TableRow, { label: q ? 'No quests match \u201c' + q + '\u201d' : 'No quests in this view', subLabel: q ? 'Clear the search or change \u201cShow\u201d.' : 'Try \u201cShow: all\u201d.' })
+            : c.group === 'none' ? view.map(questRow) : null),
+        c.group !== 'none' && sections.map(function (sec) {
+          return h(Design.TableRowGroup, { key: sec.title, title: sec.title + ' (' + sec.items.length + ')' }, sec.items.map(questRow));
+        }),
 
         h(Design.TableRowGroup, { title: 'VPN apps' },
           h(Design.TableRow, { label: vpnTop.length ? 'Best country now: ' + vpnTop.map(function (k) { return flag(k, true); }).join(', ') : 'Pick a country that unlocks the most quests', subLabel: 'Switch the VPN to it, and the plugin notices and re-checks by itself.', onPress: vpnHelp }),
@@ -1212,6 +1364,12 @@
           h(Design.TableSwitchRow, { label: 'Show live hidden quests in Discord’s Quests screen', subLabel: 'Adds hidden quests that are available or accepted to the native list. Reload after changing.', value: !!c.showHidden, onValueChange: function (v) { set({ showHidden: v }); } }),
           h(Design.TableSwitchRow, { label: 'Find my country from my IP', subLabel: 'Asks api.country.is (then ipwho.is) which country your connection is in. Nothing else is sent.', value: !!c.detectIp, onValueChange: function (v) { set({ detectIp: v }); if (v) detectCountry(true); } }),
           h(Design.TableSwitchRow, { label: 'Claim rewards automatically', subLabel: 'Claims a quest\u2019s reward once all its tasks are done. Failures show in the Last accept log.', value: !!c.autoClaim, onValueChange: function (v) { set({ autoClaim: v }); } }),
+          h(Design.TableSwitchRow, { label: 'Accept new quests automatically', subLabel: 'Off by default. Only quests that appear after you turn this on. Stops by itself if Discord asks for a captcha.', value: !!c.autoAccept, onValueChange: function (v) {
+            if (!v) { set({ autoAccept: false }); return; }
+            if (!selfAt) { setMsg('Wait until your quests have loaded, then turn this on.'); return; }
+            set({ autoAccept: true, aaBase: all.map(function (z) { return z.id; }).slice(-1000) });
+            setMsg('Auto-accept is on. The ' + all.length + ' quests that exist now are left alone.');
+          } }),
           h(Design.TableSwitchRow, { label: 'Remind me before accepted quests expire', subLabel: 'A toast 24 hours and 3 hours before.', value: !!c.remind, onValueChange: function (v) { set({ remind: v }); } }),
           h(Design.TableSwitchRow, { label: 'Alert me about new quests', subLabel: 'Says when a new quest is a hidden one.', value: !!c.alertNew, onValueChange: function (v) { set({ alertNew: v }); } }),
           h(Design.TableSwitchRow, { label: 'Soonest-expiring first', value: !!c.sortSoonest, onValueChange: function (v) { set({ sortSoonest: v }); } }),
@@ -1260,7 +1418,8 @@
   if (typeof globalThis !== 'undefined' && globalThis.__QI_TEST__) {
     exports.__test = {
       parseRegions: parseRegions, inferRegion: inferRegion, access: access, rateLimited: rateLimited, guessLanguage: guessLanguage,
-      cname: cname, flag: flag, describe: describe, redact: redact, bar: bar, timeLeft: timeLeft, regionLabel: regionLabel,
+      groupQuests: groupQuests, isCaptcha: isCaptcha, trimQuest: trimQuest, newestIds: newestIds, loadSnapshot: loadSnapshot,
+      snapshotState: function () { return { at: snapshotAt, q: selfQuests, x: selfExcluded, selfAt: selfAt }; }, cname: cname, flag: flag, describe: describe, redact: redact, bar: bar, timeLeft: timeLeft, regionLabel: regionLabel,
       state: function () { return { backoffUntil: backoffUntil, backoffLevel: backoffLevel }; },
       reset: function () { backoffUntil = 0; backoffLevel = 0; lastLimitAt = 0; },
       setRegions: function (m) { regionMap = m; replacedBy = {}; },
@@ -1388,10 +1547,11 @@
         if (isObj(cs.gone)) Object.keys(cs.gone).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.gone[k] === 'number' && cs.gone[k] > (Number(cs.goneClearedAt) || 0)) goneMap[k] = cs.gone[k]; });
         if (isObj(cs.locked)) Object.keys(cs.locked).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.locked[k] === 'number' && cs.locked[k] > (Number(cs.lockedClearedAt) || 0)) lockedMap[k] = cs.locked[k]; });
         if (isObj(cs.learned)) Object.keys(cs.learned).forEach(function (k) { var r = cs.learned[k]; if (/^\d{5,25}$/.test(k) && isObj(r) && Array.isArray(r.y) && Array.isArray(r.n)) learnedMap[k] = { y: codeList(r.y), n: codeList(r.n) }; });
+        loadSnapshot(cs.snapshot);
         loadRegions(false);
         if (cs.detectIp) detectCountry(true);
         fetchSelf(true);
-        timer = setInterval(function () { patchHttp(); if (RN.AppState.currentState === 'active') { if (cfgNow().detectIp) detectCountry(false); fetchSelf(false); maybeMeta(); maybeProbe(); remind(); if (cfgNow().autoClaim) autoClaim().catch(function (e) { ctx.plugin.reportError(e); }); } check(); }, 8000);
+        timer = setInterval(function () { patchHttp(); if (RN.AppState.currentState === 'active') { if (cfgNow().detectIp) detectCountry(false); fetchSelf(false); maybeMeta(); maybeProbe(); remind(); if (cfgNow().autoClaim) autoClaim().catch(function (e) { ctx.plugin.reportError(e); }); if (cfgNow().autoAccept) autoAccept(function () { ctx.jsonStorage.set({ autoAccept: false }).catch(function () {}); }).catch(function (e) { ctx.plugin.reportError(e); }); } check(); }, 8000);
         check();
       });
       cleanup(function () { if (timer) clearInterval(timer); });

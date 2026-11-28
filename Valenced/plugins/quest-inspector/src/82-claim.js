@@ -42,7 +42,7 @@
   }
   var claiming = false;
   async function autoClaim() {
-    if (claiming || Date.now() < backoffUntil) return;
+    if (claiming || selfAt <= 0 || Date.now() < backoffUntil) return;
     var todo = unify(collect()).filter(function (x) { return x.claimable && claimDue(x); });
     if (!todo.length) return;
     claiming = true;
@@ -64,6 +64,7 @@
     } finally { claiming = false; }
   }
   async function claimList(list, setMsg) {
+    if (selfAt <= 0) { setMsg('Your quests are still loading. Try again in a moment.'); return; }
     var ok = 0, fail = [], okNames = [];
     for (var i = 0; i < list.length; i++) {
       setMsg('Claiming ' + (i + 1) + '/' + list.length + ': ' + list[i].name + '...');
@@ -80,7 +81,50 @@
     popup(ok === list.length ? 'All ' + ok + ' claimed' : ok + ' of ' + list.length + ' claimed', lines.join('\n\n'));
   }
 
+  // ---- opt-in: accept quests that appear after the switch was turned on
+  var aaTried = {};        // quest id -> { n, at }: every quest is tried at most twice
+  var autoAccepting = false;
+  function isCaptcha(e) {
+    var b = isObj(e) && isObj(e.body) ? e.body : {};
+    return !!(b.captcha_key || b.captcha_sitekey || b.captcha_service || b.captchaKey);
+  }
+  async function autoAccept(onStop) {
+    var c = cfgNow();
+    // needs a list loaded by the plugin in the last 20 minutes: the saved copy is never enough
+    if (!c.autoAccept || autoAccepting || selfAt <= 0 || Date.now() - selfAt > 20 * 60000 || Date.now() < backoffUntil) return;
+    var base = new Set(Array.isArray(c.aaBase) ? c.aaBase : []);
+    var todo = unify(collect()).filter(function (x) {
+      if (base.has(x.id) || LIVE_STATUSES.indexOf(x.status) < 0) return false;
+      var t = own(aaTried, x.id);
+      return !t || (t.n < 2 && Date.now() - t.at > 30 * 60000);
+    }).slice(0, 3);
+    if (!todo.length) return;
+    autoAccepting = true;
+    var any = false;
+    try {
+      for (var i = 0; i < todo.length; i++) {
+        var x = todo[i], t = aaTried[x.id] || { n: 0, at: 0 };
+        t.n++; t.at = Date.now(); aaTried[x.id] = t;
+        try {
+          await enrollOne(x); any = true; t.n = 99;
+          toast('QI_AUTO_' + x.id, 'Accepted: ' + (x.known ? x.name : 'a new quest') + (x.reward ? ' (' + x.reward + ')' : ''), false, 'ok');
+        } catch (e) {
+          if (isCaptcha(e)) {
+            // Discord wants a human check: automatic accepting must not go on
+            if (onStop) onStop();
+            toast('QI_AUTO_CAPTCHA', 'Auto-accept turned off: Discord asked for a captcha. Accept quests yourself.', true, 'bad');
+            break;
+          }
+          if (t.n === 1) toast('QI_AUTOFAIL_' + x.id, 'Could not auto-accept ' + (x.known ? x.name : 'a quest') + ': ' + errText(e).slice(0, 80), true, 'bad');
+          if (Date.now() < backoffUntil) break;
+        }
+        if (i < todo.length - 1) await sleep(c.acceptDelay);
+      }
+      if (any) await reloadQuests();
+    } finally { autoAccepting = false; }
+  }
   async function acceptList(list, setMsg) {
+    if (selfAt <= 0) { setMsg('Your quests are still loading. Try again in a moment.'); return; }
     var ok = 0, fail = [], okNames = [], lockedCount = 0, delay = cfgNow().acceptDelay;
     for (var i = 0; i < list.length; i++) {
       setMsg('Accepting ' + (i + 1) + '/' + list.length + ': ' + list[i].name + '...');

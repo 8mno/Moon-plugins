@@ -44,10 +44,15 @@
     goneClearedAt: 0,    // "Retry refused quests" was pressed at this time: older refusals are ignored
     lockedClearedAt: 0,
     locked: {},          // quest id -> when Discord said it is unknown (not offered to this account/region)
+    autoAccept: false,   // opt-in: accept quests that appear after it was switched on
+    aaBase: [],          // quest ids that already existed when auto-accept was switched on (never auto-accepted)
+    group: 'none',       // none | game | reward | status
+    snapshot: null,      // { at, json } last quest list, so the screen is filled before the first load
     acceptDelay: 1500,   // ms between "Accept all" requests
     seeded: false,
     seen: []
   };
+  var GROUPS = ['none', 'game', 'reward', 'status'];
   var FILTERS = ['live hidden', 'all', 'available', 'enrolled', 'hidden', 'finished', 'not offered'];
   var REGION_FILTERS = ['any', 'global', 'regional'];
   // Third-party, community-kept list of which countries each quest is limited to. It is only used

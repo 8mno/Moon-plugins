@@ -19,17 +19,20 @@
     var tasks = isObj(tc) && isObj(tc.tasks) ? tc.tasks : null;
     var prog = isObj(us.progress) ? us.progress : null;
     out.taskText = [];
-    if (tasks && prog) {
-      var sum = 0, n = 0;
+    out.tasks = [];
+    if (tasks) {
+      var sum = 0, n = 0, pg = prog || {};
       Object.keys(tasks).forEach(function (k) {
         var target = isObj(tasks[k]) ? Number(tasks[k].target) : NaN;
         if (!(target > 0)) return;
-        var val = isObj(prog[k]) ? Number(prog[k].value) || 0 : 0;
+        var val = isObj(pg[k]) ? Number(pg[k].value) || 0 : 0;
         sum += Math.min(val / target, 1); n++;
         var secs = ['WATCH_VIDEO', 'WATCH_VIDEO_ON_MOBILE', 'PLAY_ON_DESKTOP', 'PLAY_ON_XBOX', 'PLAY_ON_PLAYSTATION', 'PLAY_ACTIVITY', 'STREAM_ON_DESKTOP'].indexOf(k) >= 0 && target >= 60;
-        out.taskText.push((TYPE_LABELS[k] || k.toLowerCase()) + ' ' + (secs ? Math.floor(Math.min(val, target) / 60) + '/' + Math.floor(target / 60) + ' min' : Math.min(val, target) + '/' + target));
+        var txt0 = secs ? Math.floor(Math.min(val, target) / 60) + '/' + Math.floor(target / 60) + ' min' : Math.min(val, target) + '/' + target;
+        out.tasks.push({ label: TYPE_LABELS[k] || k.toLowerCase(), pct: Math.round(Math.min(val / target, 1) * 100), text: txt0 });
+        if (prog) out.taskText.push((TYPE_LABELS[k] || k.toLowerCase()) + ' ' + txt0);
       });
-      if (n) out.progress = Math.round(sum / n * 100);
+      if (n && prog) out.progress = Math.round(sum / n * 100);
     }
     out.app = isObj(cfg.application) && typeof cfg.application.name === 'string' ? cfg.application.name : '';
     var txt = out.app;

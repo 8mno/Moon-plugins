@@ -54,7 +54,7 @@ let out = [];
 const labels = (tree) => { out = []; find(tree, n => n.p && n.p.label); return out.map(n => n.p.label + (n.p.subLabel ? ' || ' + n.p.subLabel : '')); };
 (async () => {
   inited = true;
-  const jsonStorage = { cache: { remind: true, reminded: [],  detectIp: true, vpns: 'Ninja VPN=https://ninja.example/x; bad=http://nope', learned: {},  showHidden: true, alertNew: true, seeded: true, seen: [], filter: 'live hidden', region: 'any', regions: {}, regionsAt: 0, meta: {}, metaAt: 0, autoMeta: true, autoProbe: true, gone: {}, acceptDelay: 10, sortSoonest: true }, get: async () => ({}), set: async (p) => { Object.assign(jsonStorage.cache, p); log.push('set ' + Object.keys(p)); }, use: () => jsonStorage.cache };
+  const jsonStorage = { cache: { autoAccept: process.env.QI_AUTOACCEPT === '1', aaBase: [], remind: true, reminded: [],  detectIp: true, vpns: 'Ninja VPN=https://ninja.example/x; bad=http://nope', learned: {},  showHidden: true, alertNew: true, seeded: true, seen: [], filter: 'live hidden', region: 'any', regions: {}, regionsAt: 0, meta: {}, metaAt: 0, autoMeta: true, autoProbe: true, gone: {}, acceptDelay: 10, sortSoonest: true }, get: async () => ({}), set: async (p) => { Object.assign(jsonStorage.cache, p); log.push('set ' + Object.keys(p)); }, use: () => jsonStorage.cache };
   const ctx = { cleanup() {}, jsonStorage, plugin: { startedLate: false, reportError: e => log.push('ERR ' + e.stack), requireReload() {} } };
   opts.start.call(ctx.plugin, ctx);
   await new Promise(r => setTimeout(r, 9000)); await new Promise(r => setTimeout(r, 14000));

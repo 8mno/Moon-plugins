@@ -20,6 +20,7 @@
   var sentLog = [];
   function tally() { var now = Date.now(); sentLog.push(now); while (sentLog.length && now - sentLog[0] > 3600000) sentLog.shift(); }
   function sentLastHour() { var now = Date.now(); while (sentLog.length && now - sentLog[0] > 3600000) sentLog.shift(); return sentLog.length; }
+  var snapshotAt = 0;   // when the saved list (shown until the first real load) was taken
   var selfQuests = [], selfExcluded = [], selfAt = 0, selfTried = 0, selfStatus = 'not loaded yet', selfLoading = null;
   function fetchSelf(force) {
     if (selfLoading) return selfLoading;
@@ -46,12 +47,53 @@
       selfAt = Date.now();
       selfActive = selfQuests.some(function (e) { var u = isObj(e.userStatus) ? e.userStatus : null; return u && u.enrolledAt && !u.completedAt && !u.claimedAt; });
       selfStatus = selfQuests.length + ' quests + ' + selfExcluded.length + ' hidden, loaded by the plugin';
+      saveSnapshot();
       return true;
     } catch (e) {
       selfStatus = rateLimited(e) ? 'Discord asked us to slow down, trying again in 10 min' : 'failed: ' + errText(e);
       return false;
     }
   }
+  // ---- saved copy of the list: the settings screen is filled the moment it opens, before the first request answers.
+  // It is stored as one JSON string (Valenced merges stored objects and arrays key by key, so a shorter list would keep old leftovers).
+  // Only what is needed to draw a row is kept, and no sealed strings. Actions never run on it: they need a fresh load (selfAt > 0).
+  function trimQuest(q) {
+    var c = isObj(q.config) ? q.config : null, o = { id: q.id };
+    if (c) {
+      var m = isObj(c.messages) ? c.messages : {}, tc = c.taskConfigV2 || c.taskConfig, rc = c.rewardsConfig, rw = isObj(rc) && Array.isArray(rc.rewards) && isObj(rc.rewards[0]) ? rc.rewards[0] : null, rm = rw && isObj(rw.messages) ? rw.messages : {};
+      var tasks = {};
+      if (isObj(tc) && isObj(tc.tasks)) Object.keys(tc.tasks).forEach(function (k) { tasks[k] = { target: isObj(tc.tasks[k]) ? tc.tasks[k].target : 0 }; });
+      o.config = { expiresAt: c.expiresAt, messages: { questName: m.questName, gameTitle: m.gameTitle }, taskConfigV2: { tasks: tasks },
+        rewardsConfig: { platforms: isObj(rc) ? rc.platforms : undefined, rewards: rw ? [{ orbQuantity: rw.orbQuantity, messages: { name: rm.name, nameWithArticle: rm.nameWithArticle } }] : [] },
+        application: { name: isObj(c.application) ? c.application.name : undefined } };
+    }
+    var u = isObj(q.userStatus) ? q.userStatus : null;
+    if (u) o.userStatus = { enrolledAt: u.enrolledAt, completedAt: u.completedAt, claimedAt: u.claimedAt, progress: u.progress };
+    return o;
+  }
+  function newestIds(list, max) {
+    return list.map(function (e) { return e.id; }).sort(function (a, b) { return a.length !== b.length ? b.length - a.length : (a < b ? 1 : -1); }).slice(0, max);
+  }
+  function saveSnapshot() {
+    try {
+      if (!storageRef) return;
+      var data = { q: selfQuests.slice(0, 60).map(trimQuest), x: newestIds(selfExcluded, 60) };
+      storageRef.set({ snapshot: { at: selfAt, json: JSON.stringify(data) } }).catch(function () {});
+    } catch (e) { /* the saved copy is only a convenience */ }
+  }
+  function loadSnapshot(s) {
+    try {
+      if (!isObj(s) || typeof s.json !== 'string' || !(s.at > Date.now() - 14 * 86400000)) return;
+      var d = JSON.parse(s.json);
+      if (!isObj(d) || !Array.isArray(d.q) || !Array.isArray(d.x)) return;
+      var ok = function (e) { return isObj(e) && typeof e.id === 'string' && /^\d{5,25}$/.test(e.id); };
+      selfQuests = d.q.filter(ok);
+      selfExcluded = d.x.filter(function (id) { return typeof id === 'string' && /^\d{5,25}$/.test(id); }).map(function (id) { return { id: id }; });
+      snapshotAt = s.at;
+      selfStatus = 'saved list from ' + Math.max(0, Math.round((Date.now() - s.at) / 60000)) + ' min ago, refreshing';
+    } catch (e) { /* ignore a damaged copy */ }
+  }
+
   // reload both our own copy and Discord's store
   // Discord's own list updates by itself after an accept or claim (it listens to the gateway), so only ask
   // it to reload (a second request to the same endpoint) when the connection changed or the user asked.
@@ -68,8 +110,13 @@
     // After a connection change Discord's own list can be an old answer. When our copy is newer than the
     // last time its screen rendered, trust ours alone for what is shown and what is hidden.
     var ours = selfAt > 0 && selfAt >= lastHookAt;
+    // the saved copy only stands in until something live exists; it must never outvote Discord's own current lists
+    var fromSnapshot = selfAt === 0 && snapshotAt > 0;
+    var live = !!f || toList(s && s.quests).length > 0;
+    var useSelf = !(fromSnapshot && live);
     return {
-      storeFound: !!s || selfAt > 0,
+      fromSnapshot: fromSnapshot && !live,
+      storeFound: !!s || selfAt > 0 || snapshotAt > 0,
       storeKeys: s ? Object.keys(s).slice(0, 40) : [],
       store: ours ? [] : toList(s && s.quests),
       storeClaimed: toList(s && s.claimedQuests),
@@ -77,8 +124,8 @@
       hookQuests: ours ? [] : toList(f && f.quests),
       hookExcluded: ours ? [] : toList(f && f.excludedQuests),
       hookClaimed: toList(c && (c.claimedQuests || c.quests)),
-      selfQuests: selfQuests,
-      selfExcluded: selfExcluded,
+      selfQuests: useSelf ? selfQuests : [],
+      selfExcluded: useSelf ? selfExcluded : [],
       hookKeys: isObj(f) ? Object.keys(f) : []
     };
   }
@@ -106,6 +153,28 @@
     var guess = inferRegion(infos);
     userRegion = cfgNow().detectIp && ipCountry.cc ? { codes: [ipCountry.cc], n: guess.n, from: 'ip', guess: guess.codes } : { codes: guess.codes, n: guess.n, from: 'quests', guess: guess.codes };
     return infos;
+  }
+
+  // Sections for the grouped list. Status sections come in a fixed order; the others biggest first.
+  var STATUS_GROUPS = ['Ready to claim', 'In progress', 'Available', 'Not offered to you', 'Finished or expired'];
+  function statusGroup(x) {
+    if (x.claimable) return STATUS_GROUPS[0];
+    if (x.status === 'enrolled') return STATUS_GROUPS[1];
+    if (LIVE_STATUSES.indexOf(x.status) >= 0) return STATUS_GROUPS[2];
+    if (x.status === 'locked') return STATUS_GROUPS[3];
+    return STATUS_GROUPS[4];
+  }
+  function groupQuests(list, mode) {
+    if (mode !== 'game' && mode !== 'reward' && mode !== 'status') return [{ title: '', items: list }];
+    var map = {}, order = [];
+    list.forEach(function (x) {
+      var key = mode === 'status' ? statusGroup(x) : mode === 'game' ? (x.app || 'No game info') : (x.reward || 'No reward info');
+      if (!Object.prototype.hasOwnProperty.call(map, key)) { map[key] = []; order.push(key); }
+      map[key].push(x);
+    });
+    if (mode === 'status') order.sort(function (a, b) { return STATUS_GROUPS.indexOf(a) - STATUS_GROUPS.indexOf(b); });
+    else order.sort(function (a, b) { return map[b].length - map[a].length || a.localeCompare(b); });
+    return order.map(function (k) { return { title: k, items: map[k] }; });
   }
 
   function applyView(list, c, query) {

@@ -3,7 +3,8 @@
   if (typeof globalThis !== 'undefined' && globalThis.__QI_TEST__) {
     exports.__test = {
       parseRegions: parseRegions, inferRegion: inferRegion, access: access, rateLimited: rateLimited, guessLanguage: guessLanguage,
-      cname: cname, flag: flag, describe: describe, redact: redact, bar: bar, timeLeft: timeLeft, regionLabel: regionLabel,
+      groupQuests: groupQuests, isCaptcha: isCaptcha, trimQuest: trimQuest, newestIds: newestIds, loadSnapshot: loadSnapshot,
+      snapshotState: function () { return { at: snapshotAt, q: selfQuests, x: selfExcluded, selfAt: selfAt }; }, cname: cname, flag: flag, describe: describe, redact: redact, bar: bar, timeLeft: timeLeft, regionLabel: regionLabel,
       state: function () { return { backoffUntil: backoffUntil, backoffLevel: backoffLevel }; },
       reset: function () { backoffUntil = 0; backoffLevel = 0; lastLimitAt = 0; },
       setRegions: function (m) { regionMap = m; replacedBy = {}; },
@@ -131,10 +132,11 @@
         if (isObj(cs.gone)) Object.keys(cs.gone).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.gone[k] === 'number' && cs.gone[k] > (Number(cs.goneClearedAt) || 0)) goneMap[k] = cs.gone[k]; });
         if (isObj(cs.locked)) Object.keys(cs.locked).forEach(function (k) { if (/^\d{5,25}$/.test(k) && typeof cs.locked[k] === 'number' && cs.locked[k] > (Number(cs.lockedClearedAt) || 0)) lockedMap[k] = cs.locked[k]; });
         if (isObj(cs.learned)) Object.keys(cs.learned).forEach(function (k) { var r = cs.learned[k]; if (/^\d{5,25}$/.test(k) && isObj(r) && Array.isArray(r.y) && Array.isArray(r.n)) learnedMap[k] = { y: codeList(r.y), n: codeList(r.n) }; });
+        loadSnapshot(cs.snapshot);
         loadRegions(false);
         if (cs.detectIp) detectCountry(true);
         fetchSelf(true);
-        timer = setInterval(function () { patchHttp(); if (RN.AppState.currentState === 'active') { if (cfgNow().detectIp) detectCountry(false); fetchSelf(false); maybeMeta(); maybeProbe(); remind(); if (cfgNow().autoClaim) autoClaim().catch(function (e) { ctx.plugin.reportError(e); }); } check(); }, 8000);
+        timer = setInterval(function () { patchHttp(); if (RN.AppState.currentState === 'active') { if (cfgNow().detectIp) detectCountry(false); fetchSelf(false); maybeMeta(); maybeProbe(); remind(); if (cfgNow().autoClaim) autoClaim().catch(function (e) { ctx.plugin.reportError(e); }); if (cfgNow().autoAccept) autoAccept(function () { ctx.jsonStorage.set({ autoAccept: false }).catch(function () {}); }).catch(function (e) { ctx.plugin.reportError(e); }); } check(); }, 8000);
         check();
       });
       cleanup(function () { if (timer) clearInterval(timer); });

@@ -109,4 +109,35 @@ test('bar and timeLeft', () => {
   assert.strictEqual(t.timeLeft(NaN), ''); assert.strictEqual(t.timeLeft(Date.now() - 1), 'expired');
   assert(/^\d+m left$/.test(t.timeLeft(Date.now() + 5 * 60000 + 500))); assert(/d \d+h left$/.test(t.timeLeft(Date.now() + 3 * 86400000)));
 });
+test('groupQuests: none, status order, game and reward by size', () => {
+  const mk = (id, o) => Object.assign({ id, name: id, app: '', reward: '', status: 'available', claimable: false }, o);
+  const list = [mk('1', { status: 'expired', app: 'B' }), mk('2', { claimable: true, app: 'A' }), mk('3', { status: 'enrolled', app: 'A', reward: 'Orbs' }), mk('4', { status: 'locked', app: 'A', reward: 'Orbs' }), mk('5', { reward: 'Orbs' }), mk('6', { reward: 'Orbs' })];
+  assert.strictEqual(t.groupQuests(list, 'none').length, 1);
+  assert.deepStrictEqual(t.groupQuests(list, 'status').map(g => g.title), ['Ready to claim', 'In progress', 'Available', 'Not offered to you', 'Finished or expired']);
+  const g = t.groupQuests(list, 'game'); assert.strictEqual(g[0].title, 'A'); assert.strictEqual(g[0].items.length, 3); assert(g.some(x => x.title === 'No game info'));
+  const r = t.groupQuests(list, 'reward'); assert.strictEqual(r[0].title, 'Orbs'); assert.strictEqual(r[0].items.length, 4);
+  assert.strictEqual(t.groupQuests(list, '__proto__').length, 1);
+});
+test('describe lists every task with a percentage, even before accepting', () => {
+  const d = t.describe({ id: ID1, config: { messages: { questName: 'A' }, taskConfigV2: { tasks: { WATCH_VIDEO: { target: 600 }, PLAY_ON_DESKTOP: { target: 1200 } } } } });
+  assert.strictEqual(d.tasks.length, 2); assert.strictEqual(d.tasks[0].pct, 0); assert(Number.isNaN(d.progress)); assert.deepStrictEqual(d.taskText, []);
+});
+test('isCaptcha', () => {
+  assert.strictEqual(t.isCaptcha({ status: 400, body: { captcha_key: ['captcha-required'], captcha_sitekey: 'x' } }), true);
+  assert.strictEqual(t.isCaptcha({ status: 404, body: { code: 260008 } }), false); assert.strictEqual(t.isCaptcha(null), false);
+});
+test('saved list: trimmed, no sealed strings, capped, loads back', () => {
+  const q = { id: ID1, metadataSealed: 'SECRET', trafficMetadataSealed: 'SECRET2', config: { expiresAt: 'x', messages: { questName: 'N', extra: 'y'.repeat(5000) }, taskConfigV2: { tasks: { WATCH_VIDEO: { target: 9, junk: 1 } } }, rewardsConfig: { rewards: [{ orbQuantity: 5, messages: { name: 'R' }, huge: 'z'.repeat(5000) }] }, application: { name: 'G' } }, userStatus: { enrolledAt: 'e', progress: { WATCH_VIDEO: { value: 3 } } } };
+  const j = JSON.stringify(t.trimQuest(q)); assert(!j.includes('SECRET') && !j.includes('yyyy') && !j.includes('zzzz'));
+  const ids = Array.from({ length: 100 }, (_, i) => String(1400000000000000000 + i * 1000)); const top = t.newestIds(ids.map(id => ({ id })), 60);
+  assert.strictEqual(top.length, 60); assert.strictEqual(top[0], ids[99]);
+  t.loadSnapshot({ at: Date.now() - 60000, json: JSON.stringify({ q: [t.trimQuest(q)], x: [ID2] }) });
+  const st = t.snapshotState(); assert.strictEqual(st.q.length, 1); assert.strictEqual(st.x[0].id, ID2); assert.strictEqual(st.selfAt, 0); assert(st.at > 0);
+  assert.strictEqual(t.describe(st.q[0]).name, 'N');
+});
+test('saved list ignores damaged or old data', () => {
+  const before = t.snapshotState().q.length;
+  t.loadSnapshot({ at: Date.now(), json: '{bad' }); t.loadSnapshot({ at: 5, json: '{"q":[],"x":[]}' }); t.loadSnapshot(null);
+  assert.strictEqual(t.snapshotState().q.length, before);
+});
 process.exit(bad ? 1 : 0);
