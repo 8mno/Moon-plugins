@@ -66,11 +66,12 @@
   var META_RETRY_FAIL = 30 * 60 * 1000;
   var META_RETRY_OK = 6 * 3600 * 1000;
   var LIVE_STATUSES = ['available', 'unverified'];
-  var PROBE_MAX = 10;                      // quests asked about per run
+  var PROBE_MAX = 6;                       // quests asked about per run
   var PROBE_MAX_AGE_DAYS = 35;             // older ids are not worth asking about
-  var PROBE_GONE_TTL = 24 * 3600 * 1000;   // how long "expired" is remembered
-  var LOCKED_TTL = 6 * 3600 * 1000;        // how long "not offered to you" is remembered; a country change or "Retry" clears it sooner
-  var PROBE_GAP = 1500;                    // ms between requests
+  var PROBE_GONE_TTL = 30 * 86400000;      // "expired" is final, so it is remembered for good (ids older than PROBE_MAX_AGE_DAYS are never asked about anyway)
+  var LOCKED_TTL = 24 * 3600 * 1000;            // how long "not offered to you" is remembered; a country change or "Retry" clears it sooner
+  var PROBE_GAP = 2000;                    // ms between requests (a random 0-1.5 s is added)
+  var BG_BUDGET = 40;                      // background requests per hour (list reloads and live checks); your own taps are never blocked by it
   var QUEST_HOME_MOBILE = 12;   // "location" Discord's accept request needs (QUEST_HOME_MOBILE)
   var DESKTOP_ONLY = ['PLAY_ON_DESKTOP', 'PLAY_ON_XBOX', 'PLAY_ON_PLAYSTATION', 'STREAM_ON_DESKTOP'];
   var TYPE_LABELS = {

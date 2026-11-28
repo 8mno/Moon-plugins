@@ -42,7 +42,7 @@
   }
   var claiming = false;
   async function autoClaim() {
-    if (claiming || selfAt <= 0 || Date.now() < backoffUntil) return;
+    if (claiming || !listFresh() || Date.now() < backoffUntil) return;
     var todo = unify(collect()).filter(function (x) { return x.claimable && claimDue(x); });
     if (!todo.length) return;
     claiming = true;
@@ -64,7 +64,7 @@
     } finally { claiming = false; }
   }
   async function claimList(list, setMsg) {
-    if (selfAt <= 0) { setMsg('Your quests are still loading. Try again in a moment.'); return; }
+    if (!listFresh()) { setMsg('Your quests are still loading. Try again in a moment.'); return; }
     var ok = 0, fail = [], okNames = [];
     for (var i = 0; i < list.length; i++) {
       setMsg('Claiming ' + (i + 1) + '/' + list.length + ': ' + list[i].name + '...');
@@ -124,7 +124,7 @@
     } finally { autoAccepting = false; }
   }
   async function acceptList(list, setMsg) {
-    if (selfAt <= 0) { setMsg('Your quests are still loading. Try again in a moment.'); return; }
+    if (!listFresh()) { setMsg('Your quests are still loading. Try again in a moment.'); return; }
     var ok = 0, fail = [], okNames = [], lockedCount = 0, delay = cfgNow().acceptDelay;
     for (var i = 0; i < list.length; i++) {
       setMsg('Accepting ' + (i + 1) + '/' + list.length + ': ' + list[i].name + '...');

@@ -16,7 +16,7 @@
     add(rowRegistered, 'Settings row', rowRegistered ? 'registered in the Valenced list' : 'not registered (open the plugin from Plugins instead)');
     add(lastClaimPlatform === null ? null : true, 'Claim platform', lastClaimPlatform === null ? 'no claim made yet' : 'worked with platform ' + lastClaimPlatform);
     var paused = now < backoffUntil;
-    add(!paused, 'Requests to Discord', sentLastHour() + ' in the last hour' + (paused ? ', paused by Discord for ' + Math.ceil((backoffUntil - now) / 60000) + ' min' : ''));
+    add(!paused, 'Requests to Discord', sentLastHour() + ' in the last hour (background limit ' + BG_BUDGET + ')' + (paused ? ', paused by Discord for ' + Math.ceil((backoffUntil - now) / 60000) + ' min' : ''));
     return items;
   }
   // Remove sealed strings and anything that looks like a token from text that is copied out.

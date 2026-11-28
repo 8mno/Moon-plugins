@@ -69,11 +69,12 @@
   var META_RETRY_FAIL = 30 * 60 * 1000;
   var META_RETRY_OK = 6 * 3600 * 1000;
   var LIVE_STATUSES = ['available', 'unverified'];
-  var PROBE_MAX = 10;                      // quests asked about per run
+  var PROBE_MAX = 6;                       // quests asked about per run
   var PROBE_MAX_AGE_DAYS = 35;             // older ids are not worth asking about
-  var PROBE_GONE_TTL = 24 * 3600 * 1000;   // how long "expired" is remembered
-  var LOCKED_TTL = 6 * 3600 * 1000;        // how long "not offered to you" is remembered; a country change or "Retry" clears it sooner
-  var PROBE_GAP = 1500;                    // ms between requests
+  var PROBE_GONE_TTL = 30 * 86400000;      // "expired" is final, so it is remembered for good (ids older than PROBE_MAX_AGE_DAYS are never asked about anyway)
+  var LOCKED_TTL = 24 * 3600 * 1000;            // how long "not offered to you" is remembered; a country change or "Retry" clears it sooner
+  var PROBE_GAP = 2000;                    // ms between requests (a random 0-1.5 s is added)
+  var BG_BUDGET = 40;                      // background requests per hour (list reloads and live checks); your own taps are never blocked by it
   var QUEST_HOME_MOBILE = 12;   // "location" Discord's accept request needs (QUEST_HOME_MOBILE)
   var DESKTOP_ONLY = ['PLAY_ON_DESKTOP', 'PLAY_ON_XBOX', 'PLAY_ON_PLAYSTATION', 'STREAM_ON_DESKTOP'];
   var TYPE_LABELS = {
@@ -83,7 +84,7 @@
     STREAM_ON_DESKTOP: 'stream', ACHIEVEMENT_IN_ACTIVITY: 'activity achievement'
   };
 
-  var PLUGIN_VERSION = '0.9.0';   // filled in from manifest.json by build.js
+  var PLUGIN_VERSION = '0.9.1';   // filled in from manifest.json by build.js
   var rowRegistered = false;  // the row in Valenced's settings list
   var lastClaimPlatform = null;
   var lastHook = {};        // last results seen from Discord's own quest hooks
@@ -330,19 +331,22 @@
     return stubIds().filter(function (id) { return !isGone(id) && !isLocked(id) && idAgeDays(id) <= PROBE_MAX_AGE_DAYS && access(id) !== 'no'; })
       .sort(function (a, b) { return idAgeDays(a) - idAgeDays(b); });   // newest first
   }
-  function loadProbe() {
+  // manual: true when the user tapped "Live check" (the hourly background budget does not apply then)
+  function loadProbe(manual) {
     if (probing) return probing;
-    probing = probeStubs().then(function (r) { probing = null; return r; }, function () { probing = null; return false; });
+    probing = probeStubs(manual).then(function (r) { probing = null; return r; }, function () { probing = null; return false; });
     return probing;
   }
   // GET /quests/{id} should return the full config only while the quest is active (per the community
   // docs; not confirmed for hidden quests, so the outcome counts are shown in Status).
-  async function probeStubs() {
+  async function probeStubs(manual) {
     var http = httpModule();
     if (!http || typeof http.get !== 'function') { probeStatus = 'Discord HTTP client not found'; return false; }
     var todo = probeCandidates();
     if (todo.length === 0) { probeStatus = 'nothing to check'; probeNextAt = Date.now() + META_RETRY_OK; return false; }
-    var batch = todo.slice(0, PROBE_MAX), found = {}, gone = {}, locked = {}, n = { ok: 0, gone: 0, locked: 0, err: 0 }, lastErr = '';
+    var room = manual ? PROBE_MAX : Math.max(0, Math.min(PROBE_MAX, BG_BUDGET - 10 - sentLastHour()));
+    if (room === 0) { probeStatus = 'waiting: this hour\u2019s request budget is used'; probeNextAt = Date.now() + 15 * 60000; return false; }
+    var batch = todo.slice(0, room), found = {}, gone = {}, locked = {}, n = { ok: 0, gone: 0, locked: 0, err: 0 }, lastErr = '';
     probeStatus = 'checking ' + batch.length + '...';
     for (var i = 0; i < batch.length; i++) {
       try {
@@ -361,7 +365,7 @@
           if (rateLimited(e)) break;
         }
       }
-      if (i < batch.length - 1) await sleep(PROBE_GAP);
+      if (i < batch.length - 1) await sleep(PROBE_GAP + Math.floor(Math.random() * 1500));
     }
     if (n.ok) setMeta(Object.assign({}, metaMap, found), metaAt || Date.now());
     Object.assign(goneMap, gone);
@@ -373,7 +377,7 @@
   }
   function maybeProbe() {
     if (probing || metaLoading || Date.now() < probeNextAt || Date.now() < backoffUntil || !cfgNow().autoProbe) return;
-    if (probeCandidates().length === 0) return;
+    if (sentLastHour() >= BG_BUDGET - 10 || probeCandidates().length === 0) return;
     probeNextAt = Date.now() + META_RETRY_FAIL;
     loadProbe();
   }
@@ -634,7 +638,7 @@
   // ---------- load the quest list ourselves, so the Quests screen never has to be opened ----------
   // GET /quests/@me is the request Discord's own Quests screen makes. Its answer has the visible quests and
   // `excluded_quests` (the hidden stubs), so the plugin can list everything on its own.
-  var SELF_TTL = 15 * 60 * 1000, SELF_TTL_ACTIVE = 3 * 60 * 1000;   // reload faster while a quest is in progress, to notice when it finishes
+  var SELF_TTL = 30 * 60 * 1000, SELF_TTL_ACTIVE = 5 * 60 * 1000, SNAPSHOT_FRESH = 5 * 60 * 1000;   // reload faster while a quest is in progress, to notice when it finishes
   var selfActive = false;
   var backoffUntil = 0;   // after Discord answers 429 (too many requests) the plugin stops asking for a while
   var backoffLevel = 0, lastLimitAt = 0;
@@ -654,10 +658,15 @@
   function tally() { var now = Date.now(); sentLog.push(now); while (sentLog.length && now - sentLog[0] > 3600000) sentLog.shift(); }
   function sentLastHour() { var now = Date.now(); while (sentLog.length && now - sentLog[0] > 3600000) sentLog.shift(); return sentLog.length; }
   var snapshotAt = 0;   // when the saved list (shown until the first real load) was taken
+  // true when the list is recent enough to act on: loaded by the plugin, or a saved copy from the last few minutes
+  function listFresh() { return selfAt > 0 || (snapshotAt > 0 && Date.now() - snapshotAt < SNAPSHOT_FRESH); }
   var selfQuests = [], selfExcluded = [], selfAt = 0, selfTried = 0, selfStatus = 'not loaded yet', selfLoading = null;
   function fetchSelf(force) {
     if (selfLoading) return selfLoading;
-    if (!force && selfAt && Date.now() - selfAt < (selfActive ? SELF_TTL_ACTIVE : SELF_TTL)) return Promise.resolve(false);
+    // while only the saved copy exists, a short wait applies: the first real load must not be postponed for half an hour
+    var last = selfAt || snapshotAt;
+    if (!force && last && Date.now() - last < (!selfAt ? SNAPSHOT_FRESH : selfActive ? SELF_TTL_ACTIVE : SELF_TTL)) return Promise.resolve(false);
+    if (!force && sentLastHour() >= BG_BUDGET) return Promise.resolve(false);
     if (!force && Date.now() - selfTried < 20000) return Promise.resolve(false);
     if (force && selfAt && Date.now() - selfTried < 10000) return Promise.resolve(false);   // button mashing never doubles the requests
     if (Date.now() < backoffUntil) return Promise.resolve(false);
@@ -723,6 +732,7 @@
       selfQuests = d.q.filter(ok);
       selfExcluded = d.x.filter(function (id) { return typeof id === 'string' && /^\d{5,25}$/.test(id); }).map(function (id) { return { id: id }; });
       snapshotAt = s.at;
+      selfActive = selfQuests.some(function (e) { var u = isObj(e.userStatus) ? e.userStatus : null; return u && u.enrolledAt && !u.completedAt && !u.claimedAt; });
       selfStatus = 'saved list from ' + Math.max(0, Math.round((Date.now() - s.at) / 60000)) + ' min ago, refreshing';
     } catch (e) { /* ignore a damaged copy */ }
   }
@@ -951,7 +961,7 @@
   }
   var claiming = false;
   async function autoClaim() {
-    if (claiming || selfAt <= 0 || Date.now() < backoffUntil) return;
+    if (claiming || !listFresh() || Date.now() < backoffUntil) return;
     var todo = unify(collect()).filter(function (x) { return x.claimable && claimDue(x); });
     if (!todo.length) return;
     claiming = true;
@@ -973,7 +983,7 @@
     } finally { claiming = false; }
   }
   async function claimList(list, setMsg) {
-    if (selfAt <= 0) { setMsg('Your quests are still loading. Try again in a moment.'); return; }
+    if (!listFresh()) { setMsg('Your quests are still loading. Try again in a moment.'); return; }
     var ok = 0, fail = [], okNames = [];
     for (var i = 0; i < list.length; i++) {
       setMsg('Claiming ' + (i + 1) + '/' + list.length + ': ' + list[i].name + '...');
@@ -1033,7 +1043,7 @@
     } finally { autoAccepting = false; }
   }
   async function acceptList(list, setMsg) {
-    if (selfAt <= 0) { setMsg('Your quests are still loading. Try again in a moment.'); return; }
+    if (!listFresh()) { setMsg('Your quests are still loading. Try again in a moment.'); return; }
     var ok = 0, fail = [], okNames = [], lockedCount = 0, delay = cfgNow().acceptDelay;
     for (var i = 0; i < list.length; i++) {
       setMsg('Accepting ' + (i + 1) + '/' + list.length + ': ' + list[i].name + '...');
@@ -1075,7 +1085,7 @@
     add(rowRegistered, 'Settings row', rowRegistered ? 'registered in the Valenced list' : 'not registered (open the plugin from Plugins instead)');
     add(lastClaimPlatform === null ? null : true, 'Claim platform', lastClaimPlatform === null ? 'no claim made yet' : 'worked with platform ' + lastClaimPlatform);
     var paused = now < backoffUntil;
-    add(!paused, 'Requests to Discord', sentLastHour() + ' in the last hour' + (paused ? ', paused by Discord for ' + Math.ceil((backoffUntil - now) / 60000) + ' min' : ''));
+    add(!paused, 'Requests to Discord', sentLastHour() + ' in the last hour (background limit ' + BG_BUDGET + ')' + (paused ? ', paused by Discord for ' + Math.ceil((backoffUntil - now) / 60000) + ' min' : ''));
     return items;
   }
   // Remove sealed strings and anything that looks like a token from text that is copied out.
@@ -1224,11 +1234,11 @@
       }
       popup(title, shortList(list, 8) + '\n\nEach one is only counted if Discord confirms it.', [
         { text: 'Cancel', style: 'cancel' },
-        { text: 'Accept', onPress: function () { busyS[1](true); acceptList(list, setMsg).finally(function () { busyS[1](false); }); } }
+        { text: 'Accept', onPress: function () { runBusy(function () { return acceptList(list, setMsg); }); } }
       ]);
     }
     function openQuest(x) { selS[1](x.id); }
-    function runBusy(fn, msg) { if (busyS[0]) { setMsg('Already working, please wait.'); return; } busyS[1](true); fn().finally(function () { busyS[1](false); }); }
+    function runBusy(fn) { if (busyS[0]) { setMsg('Already working, please wait.'); return; } busyS[1](true); fn().finally(function () { busyS[1](false); }); }
     // the page of one quest: everything known about it, per-task progress and the actions
     function questPage(x) {
       var types = x.types.map(function (t) { return TYPE_LABELS[t] || t.toLowerCase(); }).join(', ');
@@ -1323,12 +1333,12 @@
           !!claimable.length && h(Design.TableRow, {
             label: 'Claim finished quests (' + claimable.length + ')',
             subLabel: 'Claims the reward of every quest whose tasks are done.',
-            onPress: function () { if (busyS[0]) { setMsg('Already working, please wait.'); return; } busyS[1](true); claimList(claimable, setMsg).finally(function () { busyS[1](false); }); }
+            onPress: function () { runBusy(function () { return claimList(claimable, setMsg); }); }
           }),
           h(Design.TableRow, {
             label: 'Retry refused quests' + (lockedN + goneN ? ' (' + (lockedN + goneN) + ')' : ''),
             subLabel: 'Forget what Discord refused so it is checked again, e.g. after turning a VPN on or off.',
-            onPress: function () { clearRefused('all'); probeNextAt = 0; setMsg('Cleared. Refreshing...'); reloadQuests(true).then(function () { return loadProbe(); }).then(function () { setMsg('Checked again: ' + probeStatus); }, function () { setMsg('Cleared. Pull to refresh the Quests screen.'); }); }
+            onPress: function () { clearRefused('all'); probeNextAt = 0; setMsg('Cleared. Refreshing...'); reloadQuests(true).then(function () { return loadProbe(true); }).then(function () { setMsg('Checked again: ' + probeStatus); }, function () { setMsg('Cleared. Pull to refresh the Quests screen.'); }); }
           }),
           !!lockedN && h(Design.TableRow, { label: 'Why are some refused?', subLabel: 'Discord does not offer them in your region. Tap for what to do.', onPress: vpnHelp })),
 
@@ -1384,8 +1394,8 @@
           h(Design.TableRow, { label: all.length + ' quests: ' + live.length + ' available, ' + hiddenCount + ' hidden by client' + (lockedN ? ', ' + lockedN + ' not offered' : '') + (goneN ? ', ' + goneN + ' expired' : '') }),
           h(Design.TableRow, { label: 'Names: ' + (all.length - stubCount) + ' of ' + all.length + ' have details' + (stubCount ? ' (' + stubCount + ' only an id)' : ''), subLabel: 'From a community tracker (' + metaStatus + '). Quests newer than it stay as ids. Tap to download.', onPress: function () { setMsg('Downloading quest details...'); loadMeta(true).then(function (okM) { setMsg(okM ? 'Quest details updated.' : 'Quest details: ' + metaStatus); }); } }),
           h(Design.TableRow, { label: 'Regions: ' + regionStatus, subLabel: 'Updated ' + regionAge + '. Community list, may be out of date. Tap to refresh.', onPress: function () { setMsg('Updating regions...'); loadRegions(true).then(function (okR) { setMsg(okR ? 'Regions updated.' : 'Regions: ' + regionStatus); }); } }),
-          h(Design.TableRow, { label: 'Requests sent to Discord in the last hour: ' + sentLastHour(), subLabel: Date.now() < backoffUntil ? 'Discord asked for a pause, resuming in ' + Math.ceil((backoffUntil - Date.now()) / 60000) + ' min.' : 'The plugin keeps this low on purpose: it reloads every 15 min (3 min while a quest is in progress) and checks only what it must.' }),
-          h(Design.TableRow, { label: 'Live check: ' + probeStatus, subLabel: 'Asks Discord if each hidden quest is still active (newest 25 at a time). Tap to run now.', onPress: function () { setMsg('Checking with Discord...'); loadProbe().then(function () { setMsg('Live check: ' + probeStatus); }); } }),
+          h(Design.TableRow, { label: 'Requests sent to Discord in the last hour: ' + sentLastHour(), subLabel: Date.now() < backoffUntil ? 'Discord asked for a pause, resuming in ' + Math.ceil((backoffUntil - Date.now()) / 60000) + ' min.' : 'Kept low on purpose: the list reloads every 30 min (5 min while a quest is in progress), live checks stop at ' + (BG_BUDGET - 10) + ' requests an hour, and a saved list under 5 min old skips the load at start.' }),
+          h(Design.TableRow, { label: 'Live check: ' + probeStatus, subLabel: 'Asks Discord if each hidden quest is still active (newest 25 at a time). Tap to run now.', onPress: function () { setMsg('Checking with Discord...'); loadProbe(true).then(function () { setMsg('Live check: ' + probeStatus); }); } }),
           h(Design.TableRow, (function () {
             var e = enrollLog[enrollLog.length - 1];
             if (!e) return { label: 'Last accept: none yet', subLabel: 'Every accept, including Discord’s own button, is recorded here with the server’s answer.' };
@@ -1550,8 +1560,21 @@
         loadSnapshot(cs.snapshot);
         loadRegions(false);
         if (cs.detectIp) detectCountry(true);
-        fetchSelf(true);
-        timer = setInterval(function () { patchHttp(); if (RN.AppState.currentState === 'active') { if (cfgNow().detectIp) detectCountry(false); fetchSelf(false); maybeMeta(); maybeProbe(); remind(); if (cfgNow().autoClaim) autoClaim().catch(function (e) { ctx.plugin.reportError(e); }); if (cfgNow().autoAccept) autoAccept(function () { ctx.jsonStorage.set({ autoAccept: false }).catch(function () {}); }).catch(function (e) { ctx.plugin.reportError(e); }); } check(); }, 8000);
+        if (!(snapshotAt && Date.now() - snapshotAt < SNAPSHOT_FRESH)) fetchSelf(true);
+        probeNextAt = Date.now() + 60000;   // no live-check burst while the app is still starting
+        // one pass every 8 s; each step decides for itself whether it is due, so most passes send nothing
+        function tickOnce() {
+          patchHttp();
+          if (RN.AppState.currentState === 'active') {
+            var c = cfgNow();
+            if (c.detectIp) detectCountry(false);
+            fetchSelf(false); maybeMeta(); maybeProbe(); remind();
+            if (c.autoClaim) autoClaim().catch(function (e) { ctx.plugin.reportError(e); });
+            if (c.autoAccept) autoAccept(function () { ctx.jsonStorage.set({ autoAccept: false }).catch(function () {}); }).catch(function (e) { ctx.plugin.reportError(e); });
+          }
+          check();
+        }
+        timer = setInterval(tickOnce, 8000);
         check();
       });
       cleanup(function () { if (timer) clearInterval(timer); });

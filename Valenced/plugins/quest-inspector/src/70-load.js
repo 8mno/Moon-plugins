@@ -1,7 +1,7 @@
   // ---------- load the quest list ourselves, so the Quests screen never has to be opened ----------
   // GET /quests/@me is the request Discord's own Quests screen makes. Its answer has the visible quests and
   // `excluded_quests` (the hidden stubs), so the plugin can list everything on its own.
-  var SELF_TTL = 15 * 60 * 1000, SELF_TTL_ACTIVE = 3 * 60 * 1000;   // reload faster while a quest is in progress, to notice when it finishes
+  var SELF_TTL = 30 * 60 * 1000, SELF_TTL_ACTIVE = 5 * 60 * 1000, SNAPSHOT_FRESH = 5 * 60 * 1000;   // reload faster while a quest is in progress, to notice when it finishes
   var selfActive = false;
   var backoffUntil = 0;   // after Discord answers 429 (too many requests) the plugin stops asking for a while
   var backoffLevel = 0, lastLimitAt = 0;
@@ -21,10 +21,15 @@
   function tally() { var now = Date.now(); sentLog.push(now); while (sentLog.length && now - sentLog[0] > 3600000) sentLog.shift(); }
   function sentLastHour() { var now = Date.now(); while (sentLog.length && now - sentLog[0] > 3600000) sentLog.shift(); return sentLog.length; }
   var snapshotAt = 0;   // when the saved list (shown until the first real load) was taken
+  // true when the list is recent enough to act on: loaded by the plugin, or a saved copy from the last few minutes
+  function listFresh() { return selfAt > 0 || (snapshotAt > 0 && Date.now() - snapshotAt < SNAPSHOT_FRESH); }
   var selfQuests = [], selfExcluded = [], selfAt = 0, selfTried = 0, selfStatus = 'not loaded yet', selfLoading = null;
   function fetchSelf(force) {
     if (selfLoading) return selfLoading;
-    if (!force && selfAt && Date.now() - selfAt < (selfActive ? SELF_TTL_ACTIVE : SELF_TTL)) return Promise.resolve(false);
+    // while only the saved copy exists, a short wait applies: the first real load must not be postponed for half an hour
+    var last = selfAt || snapshotAt;
+    if (!force && last && Date.now() - last < (!selfAt ? SNAPSHOT_FRESH : selfActive ? SELF_TTL_ACTIVE : SELF_TTL)) return Promise.resolve(false);
+    if (!force && sentLastHour() >= BG_BUDGET) return Promise.resolve(false);
     if (!force && Date.now() - selfTried < 20000) return Promise.resolve(false);
     if (force && selfAt && Date.now() - selfTried < 10000) return Promise.resolve(false);   // button mashing never doubles the requests
     if (Date.now() < backoffUntil) return Promise.resolve(false);
@@ -90,6 +95,7 @@
       selfQuests = d.q.filter(ok);
       selfExcluded = d.x.filter(function (id) { return typeof id === 'string' && /^\d{5,25}$/.test(id); }).map(function (id) { return { id: id }; });
       snapshotAt = s.at;
+      selfActive = selfQuests.some(function (e) { var u = isObj(e.userStatus) ? e.userStatus : null; return u && u.enrolledAt && !u.completedAt && !u.claimedAt; });
       selfStatus = 'saved list from ' + Math.max(0, Math.round((Date.now() - s.at) / 60000)) + ' min ago, refreshing';
     } catch (e) { /* ignore a damaged copy */ }
   }

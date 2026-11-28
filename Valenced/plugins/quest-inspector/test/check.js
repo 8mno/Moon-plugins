@@ -7,6 +7,7 @@ const unit = (() => { try { return { out: execFileSync('node', [path.join(__dirn
 if (!unit.ok) console.log(unit.out);
 const outAA = execFileSync('node', [path.join(__dirname, 'smoke.js')], { encoding: 'utf8', timeout: 120000, stdio: ['ignore', 'pipe', 'pipe'], env: Object.assign({}, process.env, { QI_AUTOACCEPT: '1' }) });
 const checks = [
+  ['live checks stay within the per-run limit', (o) => { const m = /probed ids: (\d+)/.exec(o); return !!m && Number(m[1]) <= 8; }],
   ['auto-accept is off by default', (o) => !/toast QI_AUTO/.test(o)],
   ['auto-accept tries new quests when switched on', () => /toast QI_AUTO(FAIL)?_\d+/.test(outAA)],
   ['unit tests pass (node test/unit.js)', () => unit.ok],

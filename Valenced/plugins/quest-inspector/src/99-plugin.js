@@ -135,8 +135,21 @@
         loadSnapshot(cs.snapshot);
         loadRegions(false);
         if (cs.detectIp) detectCountry(true);
-        fetchSelf(true);
-        timer = setInterval(function () { patchHttp(); if (RN.AppState.currentState === 'active') { if (cfgNow().detectIp) detectCountry(false); fetchSelf(false); maybeMeta(); maybeProbe(); remind(); if (cfgNow().autoClaim) autoClaim().catch(function (e) { ctx.plugin.reportError(e); }); if (cfgNow().autoAccept) autoAccept(function () { ctx.jsonStorage.set({ autoAccept: false }).catch(function () {}); }).catch(function (e) { ctx.plugin.reportError(e); }); } check(); }, 8000);
+        if (!(snapshotAt && Date.now() - snapshotAt < SNAPSHOT_FRESH)) fetchSelf(true);
+        probeNextAt = Date.now() + 60000;   // no live-check burst while the app is still starting
+        // one pass every 8 s; each step decides for itself whether it is due, so most passes send nothing
+        function tickOnce() {
+          patchHttp();
+          if (RN.AppState.currentState === 'active') {
+            var c = cfgNow();
+            if (c.detectIp) detectCountry(false);
+            fetchSelf(false); maybeMeta(); maybeProbe(); remind();
+            if (c.autoClaim) autoClaim().catch(function (e) { ctx.plugin.reportError(e); });
+            if (c.autoAccept) autoAccept(function () { ctx.jsonStorage.set({ autoAccept: false }).catch(function () {}); }).catch(function (e) { ctx.plugin.reportError(e); });
+          }
+          check();
+        }
+        timer = setInterval(tickOnce, 8000);
         check();
       });
       cleanup(function () { if (timer) clearInterval(timer); });

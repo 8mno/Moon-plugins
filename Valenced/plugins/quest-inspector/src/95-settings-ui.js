@@ -84,11 +84,11 @@
       }
       popup(title, shortList(list, 8) + '\n\nEach one is only counted if Discord confirms it.', [
         { text: 'Cancel', style: 'cancel' },
-        { text: 'Accept', onPress: function () { busyS[1](true); acceptList(list, setMsg).finally(function () { busyS[1](false); }); } }
+        { text: 'Accept', onPress: function () { runBusy(function () { return acceptList(list, setMsg); }); } }
       ]);
     }
     function openQuest(x) { selS[1](x.id); }
-    function runBusy(fn, msg) { if (busyS[0]) { setMsg('Already working, please wait.'); return; } busyS[1](true); fn().finally(function () { busyS[1](false); }); }
+    function runBusy(fn) { if (busyS[0]) { setMsg('Already working, please wait.'); return; } busyS[1](true); fn().finally(function () { busyS[1](false); }); }
     // the page of one quest: everything known about it, per-task progress and the actions
     function questPage(x) {
       var types = x.types.map(function (t) { return TYPE_LABELS[t] || t.toLowerCase(); }).join(', ');
@@ -183,12 +183,12 @@
           !!claimable.length && h(Design.TableRow, {
             label: 'Claim finished quests (' + claimable.length + ')',
             subLabel: 'Claims the reward of every quest whose tasks are done.',
-            onPress: function () { if (busyS[0]) { setMsg('Already working, please wait.'); return; } busyS[1](true); claimList(claimable, setMsg).finally(function () { busyS[1](false); }); }
+            onPress: function () { runBusy(function () { return claimList(claimable, setMsg); }); }
           }),
           h(Design.TableRow, {
             label: 'Retry refused quests' + (lockedN + goneN ? ' (' + (lockedN + goneN) + ')' : ''),
             subLabel: 'Forget what Discord refused so it is checked again, e.g. after turning a VPN on or off.',
-            onPress: function () { clearRefused('all'); probeNextAt = 0; setMsg('Cleared. Refreshing...'); reloadQuests(true).then(function () { return loadProbe(); }).then(function () { setMsg('Checked again: ' + probeStatus); }, function () { setMsg('Cleared. Pull to refresh the Quests screen.'); }); }
+            onPress: function () { clearRefused('all'); probeNextAt = 0; setMsg('Cleared. Refreshing...'); reloadQuests(true).then(function () { return loadProbe(true); }).then(function () { setMsg('Checked again: ' + probeStatus); }, function () { setMsg('Cleared. Pull to refresh the Quests screen.'); }); }
           }),
           !!lockedN && h(Design.TableRow, { label: 'Why are some refused?', subLabel: 'Discord does not offer them in your region. Tap for what to do.', onPress: vpnHelp })),
 
@@ -244,8 +244,8 @@
           h(Design.TableRow, { label: all.length + ' quests: ' + live.length + ' available, ' + hiddenCount + ' hidden by client' + (lockedN ? ', ' + lockedN + ' not offered' : '') + (goneN ? ', ' + goneN + ' expired' : '') }),
           h(Design.TableRow, { label: 'Names: ' + (all.length - stubCount) + ' of ' + all.length + ' have details' + (stubCount ? ' (' + stubCount + ' only an id)' : ''), subLabel: 'From a community tracker (' + metaStatus + '). Quests newer than it stay as ids. Tap to download.', onPress: function () { setMsg('Downloading quest details...'); loadMeta(true).then(function (okM) { setMsg(okM ? 'Quest details updated.' : 'Quest details: ' + metaStatus); }); } }),
           h(Design.TableRow, { label: 'Regions: ' + regionStatus, subLabel: 'Updated ' + regionAge + '. Community list, may be out of date. Tap to refresh.', onPress: function () { setMsg('Updating regions...'); loadRegions(true).then(function (okR) { setMsg(okR ? 'Regions updated.' : 'Regions: ' + regionStatus); }); } }),
-          h(Design.TableRow, { label: 'Requests sent to Discord in the last hour: ' + sentLastHour(), subLabel: Date.now() < backoffUntil ? 'Discord asked for a pause, resuming in ' + Math.ceil((backoffUntil - Date.now()) / 60000) + ' min.' : 'The plugin keeps this low on purpose: it reloads every 15 min (3 min while a quest is in progress) and checks only what it must.' }),
-          h(Design.TableRow, { label: 'Live check: ' + probeStatus, subLabel: 'Asks Discord if each hidden quest is still active (newest 25 at a time). Tap to run now.', onPress: function () { setMsg('Checking with Discord...'); loadProbe().then(function () { setMsg('Live check: ' + probeStatus); }); } }),
+          h(Design.TableRow, { label: 'Requests sent to Discord in the last hour: ' + sentLastHour(), subLabel: Date.now() < backoffUntil ? 'Discord asked for a pause, resuming in ' + Math.ceil((backoffUntil - Date.now()) / 60000) + ' min.' : 'Kept low on purpose: the list reloads every 30 min (5 min while a quest is in progress), live checks stop at ' + (BG_BUDGET - 10) + ' requests an hour, and a saved list under 5 min old skips the load at start.' }),
+          h(Design.TableRow, { label: 'Live check: ' + probeStatus, subLabel: 'Asks Discord if each hidden quest is still active (newest 25 at a time). Tap to run now.', onPress: function () { setMsg('Checking with Discord...'); loadProbe(true).then(function () { setMsg('Live check: ' + probeStatus); }); } }),
           h(Design.TableRow, (function () {
             var e = enrollLog[enrollLog.length - 1];
             if (!e) return { label: 'Last accept: none yet', subLabel: 'Every accept, including Discord’s own button, is recorded here with the server’s answer.' };
