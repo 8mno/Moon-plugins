@@ -62,7 +62,7 @@ const labels = (tree) => { out = []; find(tree, n => n.p && n.p.label); return o
   console.log('merged native list:', JSON.stringify(hooks.useFilteredQuests().quests.map(q => q.id)));
   console.log('meta cached ids:', Object.keys(jsonStorage.cache.meta).length, 'fetched:', fetched.join(','));
   let tree = opts.SettingsComponent({ api: { jsonStorage } });
-  console.log('--- default view (live hidden)'); labels(tree).filter(l => /^Q\d|Accept all|Regions:|Accept:|quests:/.test(l)).forEach(l => console.log(' ', l));
+  console.log('--- default view (live hidden)'); labels(tree).filter(l => /^Q\d|Accept all|Regions:|Accept:|quests:|Copy report|. Discord HTTP client|. Quest list/.test(l)).forEach(l => console.log(' ', l));
   // accept all live hidden
   out = []; find(tree, n => n.p && /^Accept all live hidden/.test(n.p.label || '')); out[0].p.onPress();
   await global.POPUPS[global.POPUPS.length-1].p.actions.c.find(b => b.p.variant === 'primary').p.onPress(); await new Promise(r => setTimeout(r, 400));

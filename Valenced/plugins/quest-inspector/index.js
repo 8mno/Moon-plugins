@@ -78,6 +78,9 @@
     STREAM_ON_DESKTOP: 'stream', ACHIEVEMENT_IN_ACTIVITY: 'activity achievement'
   };
 
+  var PLUGIN_VERSION = '0.8.2';   // filled in from manifest.json by build.js
+  var rowRegistered = false;  // the row in Valenced's settings list
+  var lastClaimPlatform = null;
   var lastHook = {};        // last results seen from Discord's own quest hooks
   var lastHookAt = 0;       // when Discord's Quests screen last rendered (its data can be older than our own copy)
   var storageRef = null;    // jsonStorage, set in start()
@@ -852,6 +855,7 @@
         if (isObj(res) && typeof res.status === 'number' && res.status >= 400) throw res;
         if (errs.length) throw new Error('Discord reported: ' + bodyPreview(errs));
         if (!isObj(rb) || !(rb.claimed_at || rb.claimedAt)) throw new Error('Reply had no claimed_at, so the claim was not confirmed.');
+        lastClaimPlatform = plats[i];
         recordEnroll(x.id, true, 'claim platform ' + plats[i] + ' ok', 'claim', bodyPreview(body));
         return;
       } catch (e) {
@@ -932,6 +936,43 @@
     } catch (e) { /* the toast and the message row already said it */ }
   }
 
+  // ---------- health check and report ----------
+  // Every moving part, as { ok, name, detail }. ok: true | false | null (null = not applicable / unknown yet).
+  function healthItems() {
+    var items = [], now = Date.now();
+    function add(ok, name, detail) { items.push({ ok: ok, name: name, detail: detail }); }
+    var all = [];
+    try { all = unify(collect()); } catch (e) {}
+    add(!!httpModule(), 'Discord HTTP client', httpModule() ? 'found' : 'not found: loading and accepting cannot work. Reload the app.');
+    add(selfAt > 0, 'Quest list', selfAt > 0 ? selfStatus + ', ' + Math.max(0, Math.round((now - selfAt) / 60000)) + ' min ago' : selfStatus);
+    add(ipCountry.cc ? true : (cfgNow().detectIp ? false : null), 'Country', ipCountry.cc ? ipCountry.cc + ' (IP)' : (cfgNow().detectIp ? 'not detected: IP check ' + ipCountry.status : 'IP check is off'));
+    add(regionsAt > 0, 'Region list', regionsAt > 0 ? regionStatus + ', ' + Math.max(0, Math.round((now - regionsAt) / 3600000)) + 'h old' : regionStatus);
+    var known = all.filter(function (x) { return x.known; }).length;
+    add(all.length === 0 ? null : (known === all.length ? true : (known > 0 ? null : false)), 'Quest names', known + ' of ' + all.length + ' have details (' + metaStatus + ')');
+    var ic = ['new', 'ok', 'bad', 'copy', 'clock'].filter(function (k) { return !!icon(ICONS[k]); });
+    add(ic.length === 5 ? true : (ic.length ? null : false), 'Toast icons', ic.length + ' of 5 found');
+    add(rowRegistered, 'Settings row', rowRegistered ? 'registered in the Valenced list' : 'not registered (open the plugin from Plugins instead)');
+    add(lastClaimPlatform === null ? null : true, 'Claim platform', lastClaimPlatform === null ? 'no claim made yet' : 'worked with platform ' + lastClaimPlatform);
+    var paused = now < backoffUntil;
+    add(!paused, 'Requests to Discord', sentLastHour() + ' in the last hour' + (paused ? ', paused by Discord for ' + Math.ceil((backoffUntil - now) / 60000) + ' min' : ''));
+    return items;
+  }
+  // Remove sealed strings and anything that looks like a token from text that is copied out.
+  function redact(t) {
+    return String(t == null ? '' : t)
+      .replace(/("(?:metadata_sealed|traffic_metadata_sealed)"\s*:\s*")[^"]*(")/g, '$1[removed]$2')
+      .replace(/[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,}/g, '[token removed]');
+  }
+  function buildReport() {
+    var lines = ['Quest Inspector ' + PLUGIN_VERSION, 'time: ' + new Date().toISOString(), ''];
+    healthItems().forEach(function (i) { lines.push((i.ok === true ? '[ok] ' : i.ok === false ? '[FAIL] ' : '[--] ') + i.name + ': ' + i.detail); });
+    var c = cfgNow();
+    lines.push('', 'options: ' + ['showHidden', 'detectIp', 'autoClaim', 'remind', 'alertNew', 'autoMeta', 'autoProbe', 'autoAccept'].map(function (k) { return k + '=' + (c[k] ? 'on' : 'off'); }).join(' '));
+    lines.push('', 'recent accepts/claims (newest last):');
+    if (!enrollLog.length) lines.push('  none');
+    enrollLog.slice(-10).forEach(function (z) { lines.push('  ' + (z.ok ? 'ok ' : 'FAIL ') + z.id + ' ' + z.src + ' ' + z.text + (z.sent ? ' sent ' + z.sent : '') + ' ' + Math.round((Date.now() - z.at) / 1000) + 's ago'); });
+    return redact(lines.join('\n'));
+  }
   // ---------- Discord's own Quests screen: optionally show hidden quests ----------
   // Keep the same merged object for the same hook result, so React consumers that put the
   // result in effect/memo deps don't see a brand-new object on every render.
@@ -1072,6 +1113,7 @@
       buttons.push({ text: 'Copy JSON', onPress: function () { copyText(safe(x.q), setMsg); } });
       popup(statusIcon(x) + ' ' + (x.known ? x.name : 'Quest ' + x.id), [statusWord(x) + (x.status === 'locked' ? ' (Discord says unknown quest)' : x.status === 'unverified' ? ' (no details yet)' : ''), x.reward ? 'Reward: ' + x.reward : '', x.app ? 'Game: ' + x.app : '', timeLeft(x.expMs), regionLabel(x.id, true), x.hidden ? 'Hidden: ' + hiddenReason(x) : ''].filter(Boolean).join('\n'), buttons);
     }
+    var health = healthItems();
     var regionAge = regionsAt ? Math.max(0, Math.round((Date.now() - regionsAt) / 3600000)) + 'h ago' : 'never';
 
     // what the user should do next, in one sentence
@@ -1177,6 +1219,9 @@
           h(Design.TableSwitchRow, { label: 'Check hidden quests with Discord', subLabel: 'Small, spaced-out requests that confirm a quest is still active.', value: !!c.autoProbe, onValueChange: function (v) { set({ autoProbe: v }); } }),
           h(Design.TableRow, { label: 'Delay between accepts: ' + (c.acceptDelay / 1000) + 's', subLabel: 'Tap to change: 1s / 1.5s / 3s / 5s.', onPress: function () { set({ acceptDelay: cycle([1000, 1500, 3000, 5000], c.acceptDelay) }); } })),
 
+        h(Design.TableRowGroup, { title: 'Health check (' + health.filter(function (i) { return i.ok === false; }).length + ' problems)' },
+          health.map(function (i) { return h(Design.TableRow, { key: i.name, label: (i.ok === true ? '\u2705 ' : i.ok === false ? '\u274C ' : '\u2796 ') + i.name, subLabel: i.detail }); })),
+
         h(Design.TableRowGroup, { title: 'Details and tools' },
           h(Design.TableRow, { label: all.length + ' quests: ' + live.length + ' available, ' + hiddenCount + ' hidden by client' + (lockedN ? ', ' + lockedN + ' not offered' : '') + (goneN ? ', ' + goneN + ' expired' : '') }),
           h(Design.TableRow, { label: 'Names: ' + (all.length - stubCount) + ' of ' + all.length + ' have details' + (stubCount ? ' (' + stubCount + ' only an id)' : ''), subLabel: 'From a community tracker (' + metaStatus + '). Quests newer than it stay as ids. Tap to download.', onPress: function () { setMsg('Downloading quest details...'); loadMeta(true).then(function (okM) { setMsg(okM ? 'Quest details updated.' : 'Quest details: ' + metaStatus); }); } }),
@@ -1206,10 +1251,23 @@
             subLabel: 'Quest list: ' + selfStatus + (selfAt ? ' (' + Math.max(0, Math.round((Date.now() - selfAt) / 60000)) + ' min ago)' : ''),
             onPress: function () { setMsg('Reloading...'); reloadQuests(true).then(function () { setMsg(selfAt ? 'Reloaded: ' + selfStatus : 'Reload ' + selfStatus); }); }
           }),
+          h(Design.TableRow, { label: 'Copy report', subLabel: 'Version, health and recent accepts as text for a bug report. No token, no sealed data.', onPress: function () { copyText(buildReport(), setMsg); } }),
           h(Design.TableRow, { label: 'Copy everything as JSON', subLabel: 'Raw quests plus store/hook keys, for bug reports.', onPress: function () { copyText(safe(d), setMsg); } }))));
   }
 
   // ---------- plugin ----------
+  // Test hook: only exists when a test sets globalThis.__QI_TEST__ before loading the script.
+  if (typeof globalThis !== 'undefined' && globalThis.__QI_TEST__) {
+    exports.__test = {
+      parseRegions: parseRegions, inferRegion: inferRegion, access: access, rateLimited: rateLimited, guessLanguage: guessLanguage,
+      cname: cname, flag: flag, describe: describe, redact: redact, bar: bar, timeLeft: timeLeft, regionLabel: regionLabel,
+      state: function () { return { backoffUntil: backoffUntil, backoffLevel: backoffLevel }; },
+      reset: function () { backoffUntil = 0; backoffLevel = 0; lastLimitAt = 0; },
+      setRegions: function (m) { regionMap = m; replacedBy = {}; },
+      setUser: function (codes) { userRegion = { codes: codes, n: codes.length, from: 'ip', guess: [] }; },
+      setLearned: function (m) { learnedMap = m; }
+    };
+  }
   exports.default = plugin({
     jsonStorage: { load: true, default: DEFAULTS },
     start: function (ctx) {
@@ -1363,6 +1421,7 @@
             screen: { route: ROW, getComponent: function () { return QuestScreen; } }
           }));
           offs.push(S.addSettingsItemToSection('VALENCED', ROW, -1));
+          rowRegistered = true;
           if (typeof S.refreshSettings === 'function') S.refreshSettings();
         };
         cleanup(S.onSettingsModulesLoaded(register));
